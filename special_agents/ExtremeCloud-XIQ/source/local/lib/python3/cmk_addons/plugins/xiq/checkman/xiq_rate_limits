@@ -1,0 +1,11 @@
+title: xiq_rate_limits
+agents: piggyback
+catalog: custom/xiq
+license: GPLv2
+distribution: check_mk
+description:
+ This check monitors xiq_rate_limits. Auto-generated man page.
+ Please update this description manually.
+
+discovery:
+ One service is created.

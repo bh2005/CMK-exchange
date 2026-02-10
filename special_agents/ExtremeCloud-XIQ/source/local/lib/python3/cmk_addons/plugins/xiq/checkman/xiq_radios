@@ -1,0 +1,20 @@
+title: XIQ Radios
+agents: piggyback
+catalog: networking/wifi
+license: GPLv2
+distribution: check_mk
+description:
+ This check monitors radio information for ExtremeCloudIQ access points.
+ It evaluates per-band (2.4GHz / 5GHz / 6GHz) client counts, observed channels,
+ and transmit power values (average and minimum).
+
+ The check state is determined by two independent threshold groups:
+
+ - {CRIT} if minimum TX power is <= critical threshold
+ - {WARN} if minimum TX power is <= warning threshold
+ - {CRIT} if total clients >= critical threshold
+ - {WARN} if total clients >= warning threshold
+ - {OK}   otherwise
+
+discovery:
+ One service is created per detected radio band.

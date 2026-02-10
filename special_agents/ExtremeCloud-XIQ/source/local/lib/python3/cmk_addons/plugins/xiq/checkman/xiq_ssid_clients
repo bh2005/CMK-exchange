@@ -1,0 +1,15 @@
+title: XIQ SSID Clients
+agents: piggyback
+catalog: networking/wifi
+license: GPLv2
+distribution: check_mk
+description:
+ This check monitors per-SSID client counts on ExtremeCloudIQ access points.
+ It aggregates clients for 2.4GHz, 5GHz and 6GHz bands and exposes the total
+ client count as well as the per-band breakdown.
+
+ Thresholds for the total SSID client count are configured via the rule set
+ "XIQ SSID Clients - thresholds (per SSID)".
+
+discovery:
+ One service is created for every SSID present on the access point.
