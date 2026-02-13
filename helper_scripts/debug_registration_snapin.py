@@ -1,111 +1,101 @@
 #!/usr/bin/env python3
-# debug_registration_snapin.py - Warum erscheint das Snapin nicht?
+# -*- coding: utf-8 -*-
+# debug_snapins.py - Detaillierter Snapin-Import-Debugger
 
 import sys
 import os
+import importlib
+import traceback
+from pathlib import Path
+from datetime import datetime
 
-sys.path.insert(0, os.environ['OMD_ROOT'] + '/local/lib/python3')
-sys.path.insert(0, os.environ['OMD_ROOT'] + '/lib/python3')
+print("=" * 90)
+print("CHECKMK SIDEBAR SNAPIN REGISTRATION DEBUGGER")
+print("=" * 90)
+print(f"Run at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
 
-print("=" * 70)
-print("CHECKMK SNAPIN REGISTRATION DEBUG")
-print("=" * 70)
-
-# 1. Import Registry
-print("\n1. Registry Import...")
-from cmk.gui.sidebar._snapin import snapin_registry
-print(f"✓ snapin_registry imported: {type(snapin_registry)}")
-
-# 2. List all registered snapins BEFORE import
-print("\n2. Currently registered snapins BEFORE loading custom:")
-registered_before = sorted(snapin_registry.keys())
-print(f"   Total: {len(registered_before)}")
-for name in registered_before[:5]:
-    print(f"   - {name}")
-print(f"   ... ({len(registered_before) - 5} more)")
-
-# 3. Try to import the custom snapin
-print("\n3. Attempting to import ticket_test...")
-try:
-    from cmk.gui.plugins.sidebar.ticket_test import MiniTestSnapin
-    print(f"✓ Import successful: {MiniTestSnapin}")
-    print(f"  - Class name: {MiniTestSnapin.__name__}")
-    print(f"  - type_name: {MiniTestSnapin.type_name()}")
-    print(f"  - title: {MiniTestSnapin.title()}")
-    print(f"  - Has show(): {hasattr(MiniTestSnapin, 'show')}")
-except Exception as e:
-    print(f"✗ Import FAILED: {e}")
-    import traceback
-    traceback.print_exc()
+# 1. Verzeichnis ermitteln
+site_root = os.environ.get('OMD_ROOT')
+if not site_root:
+    print("ERROR: OMD_ROOT Umgebungsvariable nicht gesetzt!")
     sys.exit(1)
 
-# 4. Check if it's registered AFTER import
-print("\n4. Registered snapins AFTER loading custom:")
-registered_after = sorted(snapin_registry.keys())
-print(f"   Total: {len(registered_after)}")
+plugin_dir = Path(site_root) / "local" / "lib" / "python3" / "cmk" / "gui" / "plugins" / "sidebar"
+print(f"Scanning directory: {plugin_dir}\n")
 
-# 5. Check if our snapin was added
-new_snapins = set(registered_after) - set(registered_before)
-if new_snapins:
-    print(f"\n✓ NEW snapins registered:")
-    for name in new_snapins:
-        print(f"   - {name}")
-else:
-    print(f"\n✗ NO new snapins registered!")
+# 2. Alle .py Dateien finden (außer __init__.py)
+py_files = [f for f in plugin_dir.glob("*.py") if f.name != "__init__.py"]
 
-# 6. Check specifically for our snapin
-print("\n5. Checking for 'mini_test'...")
-if 'mini_test' in snapin_registry:
-    print("✓ 'mini_test' IS registered!")
-    snapin = snapin_registry['mini_test']
-    print(f"   Type: {type(snapin)}")
-    print(f"   Title: {snapin.title()}")
-    print(f"   Description: {snapin.description()}")
-else:
-    print("✗ 'mini_test' NOT registered!")
-    print("\nSearching for similar names...")
-    for name in registered_after:
-        if 'test' in name.lower() or 'mini' in name.lower() or 'ticket' in name.lower():
-            print(f"   Found: {name}")
+print(f"Found {len(py_files)} Python files:\n")
+for f in sorted(py_files):
+    print(f"   • {f.name}")
 
-# 7. Check file syntax
-print("\n6. Checking file syntax...")
-ticket_test_path = os.path.join(
-    os.environ['OMD_ROOT'],
-    'local/lib/python3/cmk/gui/plugins/sidebar/ticket_test.py'
-)
-print(f"   File: {ticket_test_path}")
-print(f"   Exists: {os.path.exists(ticket_test_path)}")
-if os.path.exists(ticket_test_path):
-    with open(ticket_test_path, 'r') as f:
-        content = f.read()
-        print(f"   Size: {len(content)} bytes")
-        print(f"   Lines: {len(content.splitlines())}")
+print("\n" + "=" * 90)
+print("Testing import of each snapin...\n")
+
+results = []
+
+for py_file in sorted(py_files):
+    module_name = py_file.stem
+    full_module = f"cmk.gui.plugins.sidebar.{module_name}"
+    
+    print(f"→ Testing: {module_name}")
+
+    try:
+        # Modul importieren
+        module = importlib.import_module(full_module)
+        print("   ✓ Module imported successfully")
+
+        # Prüfen auf Snapin-Registrierung
+        snapin_classes = []
+        for name, obj in module.__dict__.items():
+            if isinstance(obj, type) and hasattr(obj, 'type_name'):
+                snapin_classes.append(name)
         
-        # Check for key elements
-        checks = {
-            '@snapin_registry.register': '@snapin_registry.register' in content,
-            'CustomizableSidebarSnapin': 'CustomizableSidebarSnapin' in content,
-            'def type_name': 'def type_name' in content,
-            'def show': 'def show' in content,
-        }
-        print("\n   Content checks:")
-        for check, result in checks.items():
-            status = "✓" if result else "✗"
-            print(f"   {status} {check}: {result}")
+        if snapin_classes:
+            print(f"   ✓ Found snapin class(es): {snapin_classes}")
+            results.append((module_name, "SUCCESS", snapin_classes))
+        else:
+            print("   ⚠ No snapin class found (missing @snapin_registry.register?)")
+            results.append((module_name, "NO_SNAPIN", []))
 
-# 8. Try to instantiate
-print("\n7. Trying to instantiate snapin...")
-try:
-    # CustomizableSidebarSnapin might need context
-    instance = MiniTestSnapin()
-    print(f"✓ Instance created: {type(instance)}")
-    print(f"   type_name: {instance.type_name()}")
-except Exception as e:
-    print(f"✗ Instantiation failed: {e}")
-    import traceback
-    traceback.print_exc()
+    except ImportError as e:
+        print(f"   ✗ ImportError: {e}")
+        results.append((module_name, "IMPORT_ERROR", str(e)))
+    except Exception as e:
+        print(f"   ✗ Exception: {e}")
+        traceback.print_exc()
+        results.append((module_name, "EXCEPTION", str(e)))
 
-print("\n" + "=" * 70)
-print("DEBUG COMPLETE")
-print("=" * 70)
+    print("-" * 70)
+
+# 3. Zusammenfassung
+print("\n" + "=" * 90)
+print("FINAL SUMMARY")
+print("=" * 90)
+
+success = [r for r in results if r[1] == "SUCCESS"]
+failed = [r for r in results if r[1] != "SUCCESS"]
+
+print(f"Total files scanned     : {len(results)}")
+print(f"Successfully loaded     : {len(success)}")
+print(f"Failed / problematic    : {len(failed)}\n")
+
+if success:
+    print("SUCCESSFUL SNAPINS:")
+    for name, _, classes in success:
+        print(f"   ✓ {name} → {classes}")
+
+if failed:
+    print("\nPROBLEMATIC FILES:")
+    for name, status, details in failed:
+        print(f"   ✗ {name}: {status}")
+        if details:
+            print(f"      → {details[:100]}...")
+
+print("\n" + "=" * 90)
+print("EMPFEHLUNGEN:")
+print("• Wenn ein Snapin 'IMPORT_ERROR' zeigt → falscher Import-Pfad")
+print("• Wenn 'NO_SNAPIN' → fehlender @snapin_registry.register")
+print("• Wenn 'EXCEPTION' → Syntax- oder Laufzeitfehler in der Datei")
+print("=" * 90)
