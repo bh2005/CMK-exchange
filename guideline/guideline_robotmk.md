@@ -60,14 +60,16 @@
 - Agent Bakery aktiviert (CEE-Feature)
 
 **Linux Test-Host:**
-- Ubuntu 22.04 / 24.04 oder Debian 12/13 (Pflicht fuer Playwright/Browser Library!)
+- Debian 13 (Pflicht fuer Playwright/Browser Library! Debian 12/13 und Ubuntu 22.04/24.04)
 - Mindestens 2 CPU-Kerne, 4 GB RAM empfohlen
 - Internetzugang fuer RCC Environment-Build (oder offline via RCC holotree)
 - Checkmk Linux Agent installiert
 
 > **Wichtig:** Die Robot Framework Browser Library basiert auf Playwright.
-> Playwright wird von Checkmk/RCC nur auf den oben genannten Distros unterstuetzt.
-> CentOS/RHEL/SLES sind fuer Browser-Tests nicht geeignet.
+> Playwright wird von Checkmk/RCC nur auf Debian 12/13 und Ubuntu 22.04/24.04
+> unterstuetzt. CentOS/RHEL/SLES sind fuer Browser-Tests nicht geeignet.
+> Hinweis Debian 13: Das Paket `libasound2` wurde in `libasound2t64` umbenannt
+> (bereits in Schritt 2.1 beruecksichtigt).
 
 ---
 
@@ -76,7 +78,7 @@
 ### 2.1 Systemabhangigkeiten installieren
 
 ```bash
-# Ubuntu 22.04 / 24.04
+# Debian 13 (Trixie)
 sudo apt-get update
 sudo apt-get install -y \
     libglib2.0-0 \
@@ -92,7 +94,7 @@ sudo apt-get install -y \
     libxfixes3 \
     libxrandr2 \
     libgbm1 \
-    libasound2
+    libasound2t64
 ```
 
 > RCC installiert Python, Node.js und Playwright selbst in einem isolierten
@@ -104,6 +106,7 @@ Den Agent aus der Bakery herunterladen und installieren:
 
 ```bash
 # Agent von Checkmk Server holen (URL anpassen)
+# Debian 13 verwendet das .deb Paket (amd64)
 wget https://<CMK-SERVER>/<SITE>/check_mk/agents/check-mk-agent_2.4.0-1_amd64.deb
 
 sudo dpkg -i check-mk-agent_2.4.0-1_amd64.deb
