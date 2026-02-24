@@ -32,7 +32,7 @@ import urllib.request
 def fetch_web_content(url: str, timeout: int = 10) -> str:
     """
     Lädt den HTML-Inhalt des Tank-Spion-Webinterfaces.
-    Timeout: 10 Sekunden. Encoding: latin-1 (Gerät-Standard).
+    Timeout: 10 Sekunden. Encoding: latin-1 (Geraet-Standard).
     """
     try:
         with urllib.request.urlopen(url, timeout=timeout) as response:
@@ -44,15 +44,15 @@ def fetch_web_content(url: str, timeout: int = 10) -> str:
 
 def parse_all_tanks(content: str) -> list[tuple[int, float, float]]:
     """
-    Extrahiert alle Tank-Paare (Bestand, Tankgröße) aus dem HTML.
+    Extrahiert alle Tank-Paare (Bestand, Tankgroeße) aus dem HTML.
 
     Das Webinterface listet Liter-Werte als "1.234 L</td>".
     Jeweils drei aufeinanderfolgende Werte gehören zu einem Tank:
       Index 0: Bestand Tank 1
-      Index 1: Tankgröße Tank 1
+      Index 1: Tankgroeße Tank 1
       Index 2: (Rest / nicht verwendet)
       Index 3: Bestand Tank 2
-      Index 4: Tankgröße Tank 2
+      Index 4: Tankgroeße Tank 2
       ...
 
     Gibt Liste von (tank_nr, bestand_l, tanksize_l) zurück.
@@ -78,7 +78,7 @@ def parse_all_tanks(content: str) -> list[tuple[int, float, float]]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Special Agent: Tank-Spion LX-NET – Öltank-Füllstand",
+        description="Special Agent: Tank-Spion LX-NET – Oeltank-Fuellstand",
     )
     parser.add_argument(
         "--host", "-H",
