@@ -96,7 +96,7 @@ def check_tank_spion(
     bestand_l, tanksize_l = section[tank_nr]
 
     if tanksize_l <= 0:
-        yield Result(state=State.CRIT, summary=f"Tank {tank_nr}: Ungueltige Tankgröße ({tanksize_l})")
+        yield Result(state=State.CRIT, summary=f"Tank {tank_nr}: Ungueltige Tankgroesse ({tanksize_l})")
         return
 
     percent = round((bestand_l / tanksize_l) * 100, 1)

@@ -3,7 +3,7 @@
 # CheckMK 2.4 – Special Agent: Tank-Spion LX-NET
 # ================================================
 #
-# Läuft auf dem CheckMK-Server selbst.
+# Laeuft auf dem CheckMK-Server selbst.
 # Ruft das Webinterface des Tank-Spion (LX-NET) per HTTP ab,
 # parst alle Tanks und gibt den CheckMK-Agent-Output aus.
 #
@@ -31,7 +31,7 @@ import urllib.request
 
 def fetch_web_content(url: str, timeout: int = 10) -> str:
     """
-    Lädt den HTML-Inhalt des Tank-Spion-Webinterfaces.
+    Laedt den HTML-Inhalt des Tank-Spion-Webinterfaces.
     Timeout: 10 Sekunden. Encoding: latin-1 (Geraet-Standard).
     """
     try:
@@ -44,18 +44,18 @@ def fetch_web_content(url: str, timeout: int = 10) -> str:
 
 def parse_all_tanks(content: str) -> list[tuple[int, float, float]]:
     """
-    Extrahiert alle Tank-Paare (Bestand, Tankgroeße) aus dem HTML.
+    Extrahiert alle Tank-Paare (Bestand, Tankgroesse) aus dem HTML.
 
     Das Webinterface listet Liter-Werte als "1.234 L</td>".
-    Jeweils drei aufeinanderfolgende Werte gehören zu einem Tank:
+    Jeweils drei aufeinanderfolgende Werte gehoeren zu einem Tank:
       Index 0: Bestand Tank 1
-      Index 1: Tankgroeße Tank 1
+      Index 1: Tankgroesse Tank 1
       Index 2: (Rest / nicht verwendet)
       Index 3: Bestand Tank 2
-      Index 4: Tankgroeße Tank 2
+      Index 4: Tankgroesse Tank 2
       ...
 
-    Gibt Liste von (tank_nr, bestand_l, tanksize_l) zurück.
+    Gibt Liste von (tank_nr, bestand_l, tanksize_l) zurueck.
     """
     matches = re.findall(r"([\d.]+)\s*L</td>", content)
 
@@ -71,7 +71,7 @@ def parse_all_tanks(content: str) -> list[tuple[int, float, float]]:
         except ValueError:
             pass
         tank_nr += 1
-        i += 3  # je 3 Werte pro Tank (Bestand, Größe, Rest)
+        i += 3  # je 3 Werte pro Tank (Bestand, Groesse, Rest)
 
     return tanks
 

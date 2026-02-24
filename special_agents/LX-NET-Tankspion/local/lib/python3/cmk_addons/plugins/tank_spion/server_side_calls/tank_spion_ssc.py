@@ -3,7 +3,7 @@
 # CheckMK 2.4 – Server-Side-Call: Tank-Spion Special Agent
 # ==========================================================
 #
-# Übersetzt die Ruleset-Parameter in den Kommandozeilen-Aufruf
+# uebersetzt die Ruleset-Parameter in den Kommandozeilen-Aufruf
 # des Special Agents (agent_tank_spion).
 #
 # Kette:
@@ -34,10 +34,10 @@ def generate_tank_spion_command(
     host_config: HostConfig,
 ) -> Iterator[SpecialAgentCommand]:
     """
-    Erzeugt den Kommandozeilen-Aufruf für agent_tank_spion.
+    Erzeugt den Kommandozeilen-Aufruf fuer agent_tank_spion.
 
-    Verwendet immer die primäre IP-Adresse des CMK-Hosts
-    (Host = Tank-Spion-Gerät direkt).
+    Verwendet immer die primaere IP-Adresse des CMK-Hosts
+    (Host = Tank-Spion-Geraet direkt).
     """
     yield SpecialAgentCommand(
         command_arguments=[
