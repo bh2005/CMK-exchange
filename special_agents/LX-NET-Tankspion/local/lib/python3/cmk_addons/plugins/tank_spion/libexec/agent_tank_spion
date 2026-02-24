@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# CheckMK 2.4 – Special Agent: Tank-Spion LX-NET
+# ================================================
+#
+# Läuft auf dem CheckMK-Server selbst.
+# Ruft das Webinterface des Tank-Spion (LX-NET) per HTTP ab,
+# parst alle Tanks und gibt den CheckMK-Agent-Output aus.
+#
+# Output-Format (an stdout → CheckMK-Agent-Protokoll):
+#   <<<tank_spion:sep(32)>>>
+#   1 2345 3480
+#   2 890 2000
+#
+# Felder: <tank_nr> <bestand_liter> <tankgroesse_liter>
+#
+# Installation:
+#   local/share/check_mk/agents/special/agent_tank_spion
+#   chmod +x agent_tank_spion
+#
+# Aufruf durch CMK (via server_side_calls):
+#   agent_tank_spion --host <IP/Hostname>
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+import urllib.request
+
+
+def fetch_web_content(url: str, timeout: int = 10) -> str:
+    """
+    Lädt den HTML-Inhalt des Tank-Spion-Webinterfaces.
+    Timeout: 10 Sekunden. Encoding: latin-1 (Gerät-Standard).
+    """
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            return response.read().decode("latin-1", errors="replace")
+    except Exception as exc:
+        sys.stderr.write(f"ERROR: Verbindungsfehler zu {url}: {exc}\n")
+        sys.exit(1)
+
+
+def parse_all_tanks(content: str) -> list[tuple[int, float, float]]:
+    """
+    Extrahiert alle Tank-Paare (Bestand, Tankgröße) aus dem HTML.
+
+    Das Webinterface listet Liter-Werte als "1.234 L</td>".
+    Jeweils drei aufeinanderfolgende Werte gehören zu einem Tank:
+      Index 0: Bestand Tank 1
+      Index 1: Tankgröße Tank 1
+      Index 2: (Rest / nicht verwendet)
+      Index 3: Bestand Tank 2
+      Index 4: Tankgröße Tank 2
+      ...
+
+    Gibt Liste von (tank_nr, bestand_l, tanksize_l) zurück.
+    """
+    matches = re.findall(r"([\d.]+)\s*L</td>", content)
+
+    tanks = []
+    tank_nr = 1
+    i = 0
+    while i + 1 < len(matches):
+        try:
+            # Tausenderpunkte entfernen: "1.234" → 1234
+            bestand  = float(matches[i    ].replace(".", ""))
+            tanksize = float(matches[i + 1].replace(".", ""))
+            tanks.append((tank_nr, bestand, tanksize))
+        except ValueError:
+            pass
+        tank_nr += 1
+        i += 3  # je 3 Werte pro Tank (Bestand, Größe, Rest)
+
+    return tanks
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Special Agent: Tank-Spion LX-NET – Öltank-Füllstand",
+    )
+    parser.add_argument(
+        "--host", "-H",
+        required=True,
+        help="Hostname oder IP-Adresse des Tank-Spion",
+    )
+    args = parser.parse_args()
+
+    url = f"http://{args.host}"
+    content = fetch_web_content(url)
+    tanks = parse_all_tanks(content)
+
+    if not tanks:
+        sys.stderr.write(f"ERROR: Keine Tankdaten auf {url} gefunden\n")
+        sys.exit(1)
+
+    # CheckMK Agent-Output
+    print("<<<tank_spion:sep(32)>>>")
+    for tank_nr, bestand, tanksize in tanks:
+        print(f"{tank_nr} {bestand:.0f} {tanksize:.0f}")
+
+
+if __name__ == "__main__":
+    main()
