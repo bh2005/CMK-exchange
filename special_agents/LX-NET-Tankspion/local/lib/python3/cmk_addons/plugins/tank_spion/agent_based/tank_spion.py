@@ -81,7 +81,7 @@ def check_tank_spion(item: str, params: Mapping[str, Any], section: Mapping[int,
 
 check_plugin_tank_spion = CheckPlugin(
     name="tank_spion",
-    service_name="Tank Füllstand %s",
+    service_name="Tank Fuellstand %s",
     discovery_function=discover_tank_spion,
     check_function=check_tank_spion,
     check_default_parameters={},
