@@ -44,7 +44,7 @@ def parse_tank_spion(string_table: StringTable) -> TankSection:
     Parst den Agent-Output.
 
     Erwartet pro Zeile: <tank_nr> <bestand_l> <tanksize_l>
-    Zeilen mit Fehlern werden übersprungen.
+    Zeilen mit Fehlern werden uebersprungen.
     """
     section: TankSection = {}
     for row in string_table:
@@ -86,7 +86,7 @@ def check_tank_spion(
     try:
         tank_nr = int(item)
     except ValueError:
-        yield Result(state=State.UNKNOWN, summary=f"Ungültige Tank-Nummer: {item}")
+        yield Result(state=State.UNKNOWN, summary=f"Ungueltige Tank-Nummer: {item}")
         return
 
     if tank_nr not in section:
@@ -96,12 +96,12 @@ def check_tank_spion(
     bestand_l, tanksize_l = section[tank_nr]
 
     if tanksize_l <= 0:
-        yield Result(state=State.CRIT, summary=f"Tank {tank_nr}: Ungültige Tankgröße ({tanksize_l})")
+        yield Result(state=State.CRIT, summary=f"Tank {tank_nr}: Ungueltige Tankgröße ({tanksize_l})")
         return
 
     percent = round((bestand_l / tanksize_l) * 100, 1)
 
-    # Schwellwerte aus Regel (Füllstand-UNTERSCHREITUNG = Problem)
+    # Schwellwerte aus Regel (Fuellstand-UNTERSCHREITUNG = Problem)
     warn_perc = params.get("warn_perc", 40.0)
     crit_perc = params.get("crit_perc", 25.0)
 
@@ -153,5 +153,5 @@ check_plugin_tank_spion = CheckPlugin(
         "crit_perc": 25.0,
         "umrechnung_kg": 0.0,
     },
-    check_ruleset_name="tank_spion",   # muss mit rule_spec name= übereinstimmen
+    check_ruleset_name="tank_spion",   # muss mit rule_spec name= uebereinstimmen
 )
