@@ -35,19 +35,19 @@ from cmk.rulesets.v1.rule_specs import (
 # ══════════════════════════════════════════════════════════════════════════════
 # 1. Special Agent Datasource Rule
 #    Aktiviert den Special Agent für den Host.
-#    Keine Parameter nötig — IP kommt direkt vom CMK-Host.
+#    Keine Parameter noetig — IP kommt direkt vom CMK-Host.
 # ══════════════════════════════════════════════════════════════════════════════
 
 rule_spec_tank_spion_datasource = SpecialAgent(
     name="tank_spion",
-    title=Title("Tank-Spion LX-NET (Öltank-Füllstand)"),
+    title=Title("Tank-Spion LX-NET (Oeltank-Fuellstand)"),
     topic=Topic.APPLICATIONS,
     help_text=Help(
         "Aktiviert den Special Agent für TECSON Tank-Spion LX-NET Geräte. "
-        "Der Agent ruft das Webinterface des Geräts direkt per HTTP ab. "
+        "Der Agent ruft das Webinterface des Geraets direkt per HTTP ab. "
         "Die IP-Adresse des Hosts wird als Zieladresse verwendet. "
         "Schwellwerte werden pro Tank über die Regel "
-        "'Tank-Spion LX-NET Füllstand' konfiguriert."
+        "'Tank-Spion LX-NET Fuellstand' konfiguriert."
     ),
     parameter_form=lambda: Dictionary(
         elements={},   # keine Parameter nötig
