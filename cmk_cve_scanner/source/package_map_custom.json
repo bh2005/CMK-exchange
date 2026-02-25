@@ -1,0 +1,13 @@
+{
+  "_comment": "Eigene Package-Name-Mappings fuer den CVE Scanner.",
+  "_format":  "{ 'debian_paketname': ['nvd_product', 'nvd_vendor'] }",
+  "_hint":    "nvd_vendor 'null' = nur Keyword-Suche",
+
+  "BEISPIELE (auskommentieren zum Aktivieren)":
+    ["beispiel_product", "beispiel_vendor"],
+
+  "_beispiel_haproxy_enterprise": ["haproxy-enterprise", "haproxy"],
+  "_beispiel_checkmk_site":       ["checkmk",            "tribe29"],
+
+  "EIGENE_EINTRAEGE_HIER": ["", null]
+}
