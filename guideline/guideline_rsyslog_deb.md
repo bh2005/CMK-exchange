@@ -111,10 +111,10 @@ mail.*                           /var/log/mail.log
 
 | Level | Nummer | Bedeutung |
 |---|---|---|
-| emerg | 0 | System ist nicht nutzbar |
-| alert | 1 | Sofortige Aktion erforderlich |
-| crit | 2 | Kritischer Zustand |
-| err | 3 | Fehler |
+<span style="color:red">| emerg | 0 | System ist nicht nutzbar |</span>
+<span style="color:red">| alert | 1 | Sofortige Aktion erforderlich |</span>
+<span style="color:red">| crit | 2 | Kritischer Zustand |</span>
+<span style="color:yellow">| err | 3 | Fehler |</span>
 | warning | 4 | Warnung |
 | notice | 5 | Normaler, aber bedeutsamer Zustand |
 | info | 6 | Informationsmeldung |
