@@ -907,3 +907,98 @@ Date: 2025-02-10
 **Ende der Guideline**
 
 Dieses Dokument basiert auf Checkmk 2.4+ und sollte für alle 2.x Versionen funktionieren.
+
+---
+
+## CMK 2.5 – Breaking Changes & Migration
+
+### 1. `show()` – neuer Pflichtparameter `config`
+
+```python
+# CMK 2.4 (ALT):
+def show(self) -> None:
+    ...
+
+# CMK 2.5 (NEU):
+from cmk.gui.config import Config   # ← neuer Import
+
+def show(self, config: Config) -> None:
+    ...
+```
+
+### 2. `type_name()` – von `@staticmethod` zu `@classmethod`
+
+```python
+# CMK 2.4 (ALT):
+@staticmethod
+def type_name() -> str:
+    return "my_snapin"
+
+# CMK 2.5 (NEU):
+@classmethod
+def type_name(cls) -> str:
+    return "my_snapin"
+```
+
+### 3. `refresh_interval()` entfernt
+
+Die Methode `refresh_interval()` existiert in CMK 2.5 nicht mehr. Für Auto-Refresh nur noch `refresh_regularly()` verwenden:
+
+```python
+# CMK 2.4 (ALT – nicht mehr vorhanden!):
+@classmethod
+def refresh_interval(cls) -> int:
+    return 30
+
+# CMK 2.5 (NEU – nur noch Bool):
+@classmethod
+def refresh_regularly(cls) -> bool:
+    return True   # Refresh-Intervall wird von CMK selbst bestimmt
+```
+
+### 4. CMK 2.5 Minimal-Template (komplett)
+
+```python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# my_snapin.py – CMK 2.5
+
+from cmk.gui.config import Config                        # ← NEU in 2.5
+from cmk.gui.i18n import _
+from cmk.gui.plugins.sidebar.utils import SidebarSnapin, snapin_registry
+from cmk.gui.htmllib.html import html
+
+
+@snapin_registry.register
+class MySnapin(SidebarSnapin):
+
+    @classmethod                                          # ← war @staticmethod in 2.4
+    def type_name(cls) -> str:
+        return "my_snapin"
+
+    @classmethod
+    def title(cls) -> str:
+        return _("My Snapin")
+
+    @classmethod
+    def description(cls) -> str:
+        return _("Example snapin for CMK 2.5")
+
+    @classmethod
+    def refresh_regularly(cls) -> bool:
+        return True
+
+    def show(self, config: Config) -> None:               # ← config-Parameter in 2.5
+        html.open_div(class_="my_snapin")
+        html.write_text(_("Hello from CMK 2.5 Snapin!"))
+        html.close_div()
+```
+
+### Schnell-Checkliste Migration 2.4 → 2.5
+
+- [ ] `from cmk.gui.config import Config` hinzugefügt
+- [ ] `def show(self, config: Config) -> None:` angepasst
+- [ ] `type_name()`: `@staticmethod` → `@classmethod` + `cls` Parameter
+- [ ] `refresh_interval()` entfernt (falls vorhanden)
+- [ ] MKP: `version.min_required` auf `"2.5.0p1"` gesetzt
+

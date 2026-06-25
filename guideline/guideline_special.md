@@ -267,3 +267,117 @@ rule_spec_special_agent_myapi = SpecialAgent(
 - [ ] README.md mit Install-Anleitung
 
 Viel Erfolg beim nächsten Special Agent!  
+
+---
+
+## CMK 2.5 – Breaking Changes & Migration
+
+### Signaturänderung `commands_function`
+
+In CMK 2.4 hatte `commands_function` drei Parameter (inkl. `HostSettings`). Ab CMK 2.5 entfällt `HostSettings` komplett:
+
+```python
+# CMK 2.4 (ALT):
+from cmk.server_side_calls.v1 import HostConfig, HostSettings, ...
+
+def _commands(
+    params: MyApiParams,
+    host_config: HostConfig,
+    _host_settings: HostSettings,      # ← entfällt in 2.5
+) -> Iterator[SpecialAgentCommand]:
+    ...
+
+# CMK 2.5 (NEU):
+from cmk.server_side_calls.v1 import HostConfig, ...  # kein HostSettings mehr
+
+def _commands(
+    params: MyApiParams,
+    host_config: HostConfig,
+) -> Iterator[SpecialAgentCommand]:
+    ...
+```
+
+### Passwort-Parameter: Pydantic statt `noop_parser`
+
+`noop_parser` leitet Secrets als Klartext weiter – für echte Passwort-Parameter ist das Pydantic-Modell mit `Secret` der empfohlene Weg:
+
+```python
+# CMK 2.5 – korrekte Passwort-Behandlung:
+from pydantic import BaseModel
+from cmk.server_side_calls.v1 import Secret, SpecialAgentConfig
+
+class MyParams(BaseModel):
+    url: str
+    password: Secret
+
+def _commands(params: MyParams, host_config: HostConfig) -> Iterator[SpecialAgentCommand]:
+    args = ["--url", params.url, "--password", params.password.unsafe()]
+    yield SpecialAgentCommand(command_arguments=args)
+
+special_agent_myapi = SpecialAgentConfig(
+    name="myapi",
+    parameter_parser=MyParams.model_validate,   # ← statt noop_parser
+    commands_function=_commands,
+)
+```
+
+`noop_parser` bleibt in 2.5 verfügbar und funktioniert weiterhin für parameterlose Agenten (z. B. Agenten ohne Credentials, wie Tank-Spion).
+
+### Graphing API – `color` Modul entfernt
+
+```python
+# CMK 2.4 (ALT):
+from cmk.graphing.v1 import metrics, unit, color
+color=color.BLUE,
+color=color.GREY,    # ← GREY (britische Schreibweise)
+
+# CMK 2.5 (NEU):
+from cmk.graphing.v1 import metrics, unit   # kein 'color' mehr
+color=metrics.Color.BLUE,
+color=metrics.Color.GRAY,    # ← umbenannt zu GRAY (amerikanische Schreibweise)
+```
+
+### MKP – Mindestversion
+
+```python
+# info.json für CMK 2.5:
+"version.min_required": "2.5.0p1"
+```
+
+### CMK 2.5 Beispiel – Minimaler Special Agent (komplett)
+
+```python
+# server_side_calls/myapi_ssc.py – CMK 2.5
+
+from typing import Iterator
+from pydantic import BaseModel
+from cmk.server_side_calls.v1 import (
+    HostConfig, Secret, SpecialAgentCommand, SpecialAgentConfig,
+)
+
+class MyApiParams(BaseModel):
+    url: str
+    api_key: Secret
+    verify_tls: bool = True
+
+def _commands(params: MyApiParams, host_config: HostConfig) -> Iterator[SpecialAgentCommand]:
+    args = ["--url", params.url, "--api-key", params.api_key.unsafe()]
+    if not params.verify_tls:
+        args.append("--no-cert-check")
+    yield SpecialAgentCommand(command_arguments=args)
+
+special_agent_myapi = SpecialAgentConfig(
+    name="myapi",
+    parameter_parser=MyApiParams.model_validate,
+    commands_function=_commands,
+)
+```
+
+### Schnell-Checkliste Migration 2.4 → 2.5
+
+- [ ] `HostSettings` aus Import und Funktionssignatur entfernt
+- [ ] Passwort-Parameter auf Pydantic-`Secret`-Modell umgestellt
+- [ ] Graphing: `from cmk.graphing.v1 import color` entfernt
+- [ ] Graphing: `color.X` → `metrics.Color.X`, `GREY` → `GRAY`
+- [ ] MKP: `version.min_required` auf `"2.5.0p1"` gesetzt
+

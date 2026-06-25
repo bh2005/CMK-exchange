@@ -211,3 +211,46 @@ Enthält (Stand 2026) oft folgende Beispiele:
 - Für UI-Parameter → immer `vs_parameters()` mit `Dictionary` nutzen
 - Packaging → als **MKP** ausliefern (sehr einfach mit `mkp create`)
 - Forum-Beitrag oder GitHub-Issue → wenn etwas unklar ist (z. B. neue Dashlet-Features in 2.4)
+
+---
+
+## CMK 2.5 – Dashlets in der neuen Vue-Oberfläche
+
+### ⚠️ Custom Python-Dashlets funktionieren NICHT im Vue-Dashboard
+
+Ab CMK 2.5 ist das Standard-Dashboard eine **neue Vue.js-basierte Oberfläche**. Eigene Python-Dashlets (via `dashlet_registry`) erscheinen dort **nicht** im Dashlet-Picker.
+
+**Grund:** Der Widget-Picker ist über zwei Stellen im CMK-Core hartcodiert:
+
+1. `INTERNAL_TO_API_TYPE_NAME` – eine Mapping-Tabelle mit ca. 30 Built-in-Typen (hardcoded, nicht erweiterbar durch MKPs)
+2. `WidgetContent` – eine geschlossene Pydantic-Discriminated-Union; neue Einträge können von außen nicht hinzugefügt werden
+
+### Was noch funktioniert
+
+| Szenario | Status |
+|---|---|
+| Klassische Dashboard-Ansicht (nicht Vue) | ✅ funktioniert weiterhin |
+| Eigenes Python-Dashlet in klassischem Dashboard | ✅ funktioniert |
+| Eigenes Python-Dashlet in Vue-Dashboard-Picker | ❌ erscheint nicht |
+| Eigenes Python-Dashlet programmatisch im Vue-Dashboard | ❌ nicht möglich |
+
+### Workaround: Built-in `url`-Widget (Custom URL / iFrame)
+
+Das einzige eingebaute Widget, das beliebigen HTML-Inhalt anzeigt, ist der **Custom URL**-Dashlet-Typ (`url`). Er kann per `iFrame` auf jede interne oder externe URL verweisen.
+
+```
+Dashboard → Edit → Add widget → "Custom URL"
+→ URL: /myapp/dashboard/  (oder externe URL)
+→ iFrame-Höhe konfigurieren
+```
+
+Für eigene HTML-Visualisierungen in CMK 2.5:
+1. Eigene Webanwendung (Flask, FastAPI, etc.) als separaten Service betreiben
+2. URL des Dienstes im Custom-URL-Dashlet eintragen
+3. Alternativ: Eine CMK-eigene View oder Report verwenden, die per URL erreichbar ist
+
+### Ausblick
+
+Checkmk plant laut Community-Forum keine offizielle Erweiterbarkeit der Vue-Widget-Liste für externe MKPs in der näheren Zukunft. Für Custom Dashlets bleibt der klassische Dashboard-Typ die einzige sichere Option.
+
+Forum-Thread: https://forum.checkmk.com (Suche nach „custom dashlet vue 2.5")
