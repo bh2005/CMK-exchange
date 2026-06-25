@@ -1,0 +1,1068 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# =============================================================================
+# License: GNU General Public License v2
+#
+# Author: Bernd Holzhauer
+# Date  : 2026-02-04
+# File  : agent_xiq
+#
+# Description:
+#   Checkmk Special Agent for ExtremeCloudIQ (XIQ).
+#   - Logs into XIQ, caches JWT for 1 hour.
+#   - Performs a lightweight rate-limit handshake and publishes
+#     <<<extreme_cloud_iq_rate_limits>>>.
+#   - Retrieves devices (FULL, REAL), filters APs (managed_by=XIQ, connected).
+#   - Gathers active WiFi clients via /clients/active using batched
+#     multi-device queries (no connected=true; views=FULL; clientConnectionTypes=1;
+#     excludeLocallyManaged=false; sortOrder=ASC; paging with limit=100).
+#   - Fetches radio-information with fast-first + two fallbacks.
+#   - Emits piggyback hosts per AP with:
+#       - labels, host attributes
+#       - <<<extreme_ap_status>>>
+#       - <<<extreme_ap_clients>>>
+#       - <<<extreme_ap_neighbors>>>
+#       - <<<xiq_radio_information:json>>>
+#       - <<<xiq_active_clients:json>>>
+#   - Publishes H1 sections:
+#       - <<<extreme_summary>>>
+#       - <<<extreme_device_inventory>>>
+#       - <<<extreme_device_neighbors>>>
+#
+# Notes:
+#   - Terminology: "API rate-limit usage" instead of "expenses".
+# =============================================================================
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from typing import Any, Dict, List, Optional, Tuple, Iterable
+
+import requests
+
+# Local helpers (keep names as used by your checks/inventory)
+from cmk_addons.plugins.xiq.agent_based.common import (
+    _clean_text,
+    format_mac,
+    norm_band_from_active_client,
+)
+
+
+# ---------------------------------------------------------------------
+# CLI – parse arguments
+# ---------------------------------------------------------------------
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Checkmk Special Agent for ExtremeCloudIQ")
+
+    p.add_argument("--url", default="https://api.extremecloudiq.com")
+    p.add_argument("--username", required=True)
+    p.add_argument("--password", required=True)
+    p.add_argument("--timeout", type=int, default=30)
+    p.add_argument("--host", required=True)
+    p.add_argument("--no-cert-check", action="store_true")
+    p.add_argument("--proxy", default=None)
+
+    # Multi-device batching for /clients/active
+    p.add_argument("--clients-batch-size", type=int, default=10)
+    p.add_argument("--clients-max-pages", type=int, default=10)
+    p.add_argument("--clients-page-limit", type=int, default=100)
+    p.add_argument("--clients-views", default="FULL")
+    p.add_argument("--clients-sort-order", default="ASC")
+
+    return p.parse_args()
+
+
+# ---------------------------------------------------------------------
+# Small utils – safe conversions, short location
+# ---------------------------------------------------------------------
+def _safe_int(v: Any, default: int = 0) -> int:
+    try:
+        if v is None:
+            return default
+        return int(v)
+    except Exception:
+        return default
+
+
+def _shorten_location(locations: Any) -> str:
+    """
+    Produce a compact location leaf, preferring tokens starting with 'LOC'.
+    Input may be a list of strings or dicts with 'name'/'path'.
+    """
+    if not locations:
+        return ""
+    try:
+        names: List[str] = []
+        for e in locations:
+            if isinstance(e, str):
+                names.append(e)
+            elif isinstance(e, dict):
+                names.append(e.get("name") or e.get("path") or str(e.get("id", "")))
+        names = [n.strip() for n in names if n]
+        if not names:
+            return ""
+        last = names[-1].upper()
+        prev = names[-2].upper() if len(names) >= 2 else last
+        if "LOC" in prev:
+            idx = prev.rfind("LOC")
+            return prev[idx:]
+        if "LOC" in last:
+            idx = last.rfind("LOC")
+            return last[idx:]
+        return prev
+    except Exception:
+        return ""
+
+
+# ---------------------------------------------------------------------
+# HTTP session (TLS/proxy), token cache (per site host)
+# ---------------------------------------------------------------------
+def _mk_session(verify: bool, proxy: Optional[str]) -> requests.Session:
+    s = requests.Session()
+    s.verify = verify
+    if proxy:
+        s.proxies = {"http": proxy, "https": proxy}
+    if not verify:
+        try:
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        except Exception:
+            pass
+    return s
+
+
+def _cache_path(site_host: str) -> str:
+    root = os.environ.get("OMD_ROOT", "/tmp")
+    path = os.path.join(root, "var", "check_mk", "special_agents", "xiq")
+    os.makedirs(path, exist_ok=True)
+    return os.path.join(path, f"{site_host}.json")
+
+
+def _cache_load(cf: str) -> Optional[str]:
+    try:
+        with open(cf, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if time.time() - data.get("ts", 0) < 3600:
+            return data.get("access_token")
+    except Exception:
+        pass
+    return None
+
+
+def _cache_save(cf: str, token: str) -> None:
+    tmp = cf + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"access_token": token, "ts": time.time()}, f)
+    os.replace(tmp, cf)
+
+
+# ---------------------------------------------------------------------
+# HTTP JSON – with retries, backoff, and 401/429 handling
+# ---------------------------------------------------------------------
+def api_login(
+    base_url: str,
+    username: str,
+    password: str,
+    timeout: int,
+    verify: bool,
+    proxy: Optional[str],
+    cachefile: str,
+) -> str:
+    s = _mk_session(verify, proxy)
+    r = s.post(
+        f"{base_url.rstrip('/')}/login",
+        json={"username": username, "password": password},
+        timeout=timeout,
+    )
+    r.raise_for_status()
+    token = r.json().get("access_token")
+    if not token:
+        raise RuntimeError("Login response contained no access_token")
+    _cache_save(cachefile, token)
+    return token
+
+
+def api_request_json(
+    base_url: str,
+    path: str,
+    token: str,
+    timeout: int,
+    verify: bool,
+    proxy: Optional[str],
+    method: str = "GET",
+    params: Optional[Any] = None,
+):
+    """
+    Generic JSON request wrapper.
+
+    Returns:
+      ("OK", json_or_None, resp) on success
+      ("RELOGIN", None, resp) on HTTP 401
+      ("ERROR", None, None) if all retries failed
+    """
+    url = f"{base_url.rstrip('/')}{path}"
+    backoffs = [1, 2, 4, 8, 16, 30]
+
+    for sleep_s in [0] + backoffs:
+        if sleep_s:
+            time.sleep(sleep_s)
+
+        try:
+            s = _mk_session(verify, proxy)
+            headers = {"Authorization": f"Bearer {token}"}
+            r = s.request(method, url, headers=headers, params=params, timeout=timeout)
+
+            if r.status_code == 401:
+                return "RELOGIN", None, r
+            if r.status_code == 429:
+                # back off and retry
+                continue
+
+            r.raise_for_status()
+
+            try:
+                return "OK", r.json(), r
+            except ValueError:
+                return "OK", None, r
+
+        except requests.exceptions.Timeout:
+            continue
+        except Exception:
+            continue
+
+    return "ERROR", None, None
+
+
+# ---------------------------------------------------------------------
+# Rate-limit helpers – parse headers, handshake with light endpoints
+# ---------------------------------------------------------------------
+def _to_int_safe_str(val: Optional[str]) -> Optional[int]:
+    if val is None:
+        return None
+    s = str(val).strip()
+    if not s:
+        return None
+    try:
+        return int(s)
+    except Exception:
+        try:
+            return int(float(s))
+        except Exception:
+            return None
+
+
+def _parse_limit_header(raw: Optional[str]) -> Tuple[Optional[int], Optional[int]]:
+    """
+    Parse "RateLimit-Limit" header like:
+      "7500;w=3600" -> (7500, 3600)
+      "7500"        -> (7500, None)
+    """
+    if not raw:
+        return None, None
+    text = str(raw).strip()
+    limit_part = text
+    window_s = None
+    if ";" in text:
+        parts = [p.strip() for p in text.split(";") if p.strip()]
+        limit_part = parts[0]
+        for p in parts[1:]:
+            if p.startswith("w="):
+                window_s = _to_int_safe_str(p.split("=", 1)[1])
+    limit_val = _to_int_safe_str(limit_part)
+    return limit_val, window_s
+
+
+def _rate_limit_from_resp(resp) -> Dict[str, Any]:
+    try:
+        headers_case = dict(resp.headers)
+    except Exception:
+        headers_case = {}
+    hdr = {k.lower(): v for k, v in headers_case.items()}
+
+    raw_limit = hdr.get("ratelimit-limit") or hdr.get("x-ratelimit-limit")
+    raw_remaining = hdr.get("ratelimit-remaining") or hdr.get("x-ratelimit-remaining")
+    raw_reset = hdr.get("ratelimit-reset") or hdr.get("x-ratelimit-reset")
+
+    limit_val, window_s = _parse_limit_header(raw_limit)
+    remaining_val = _to_int_safe_str(raw_remaining)
+    reset_val = _to_int_safe_str(raw_reset)
+
+    info = {
+        "state": "OK",
+        "limit": limit_val,
+        "remaining": remaining_val,
+        "reset_in_seconds": reset_val,
+        "window_s": window_s,
+        "headers": headers_case,
+        "status_code": getattr(resp, "status_code", None),
+    }
+
+    if (
+        info["limit"] is None
+        and info["remaining"] is None
+        and info["reset_in_seconds"] is None
+        and info["window_s"] is None
+    ):
+        info["state"] = "UNLIMITED"
+    return info
+
+
+def _rate_limit_try_paths_raw(
+    base_url: str, token: str, timeout: int, verify: bool, proxy: Optional[str]
+) -> Tuple[bool, Dict[str, Any]]:
+    """
+    Try several super-light endpoints to obtain rate-limit headers without
+    heavy traffic. Uses allow_redirects=False to avoid surprises.
+    """
+    s = _mk_session(verify, proxy)
+    headers = {"Authorization": f"Bearer {token}", "Connection": "keep-alive"}
+
+    def _probe(path: str):
+        url = f"{base_url.rstrip('/')}{path}"
+        try:
+            r = s.get(url, headers=headers, timeout=timeout, allow_redirects=False)
+            if r.status_code == 401:
+                return False, {"state": "RELOGIN", "status_code": r.status_code}
+            info = _rate_limit_from_resp(r)
+            info["status_code"] = r.status_code
+            return True, info
+        except Exception as e:
+            return False, {"state": "NO_RESPONSE", "error": str(e)}
+
+    # 1) /devices?page=1&limit=1&views=ID&async=false
+    ok1, info1 = _probe("/devices?page=1&limit=1&views=ID&async=false")
+    if ok1:
+        return True, info1
+    if info1.get("state") == "RELOGIN":
+        return False, info1
+
+    # 2) /account/profile
+    ok2, info2 = _probe("/account/profile")
+    if ok2:
+        return True, info2
+    if info2.get("state") == "RELOGIN":
+        return False, info2
+
+    # 3) /devices/radio-information?page=1&limit=1&async=false
+    ok3, info3 = _probe("/devices/radio-information?page=1&limit=1&async=false")
+    if ok3:
+        return True, info3
+
+    error = info1.get("error") or info2.get("error") or info3.get("error") or "rate-limit scan failed"
+    return False, {"state": "NO_RESPONSE", "error": error}
+
+
+def fetch_rate_limits(
+    base_url: str,
+    token: str,
+    timeout: int,
+    verify: bool,
+    proxy: Optional[str],
+) -> Tuple[bool, Dict[str, Any]]:
+    ok, data = _rate_limit_try_paths_raw(base_url, token, timeout, verify, proxy)
+    if data.get("state") == "RELOGIN":
+        return False, data
+    if ok:
+        return True, data
+
+    # Final fallback attempt against /devices
+    try:
+        status, _json, resp = api_request_json(
+            base_url,
+            "/devices",
+            token,
+            timeout,
+            verify,
+            proxy,
+            params={"page": 1, "limit": 1, "views": "ID", "async": "false"},
+        )
+        if resp is not None:
+            return True, _rate_limit_from_resp(resp)
+    except Exception:
+        pass
+
+    return False, data
+
+
+def print_rate_limits_section(rl: Dict[str, Any]) -> None:
+    """
+    Emit <<<extreme_cloud_iq_rate_limits:sep(124)>>> for Checkmk.
+    """
+    print("<<<extreme_cloud_iq_rate_limits:sep(124)>>>")
+    state = rl.get("state") or "UNKNOWN"
+    print(f"state|{state}")
+
+    for key in ("limit", "remaining", "reset_in_seconds", "window_s", "status_code"):
+        val = rl.get(key)
+        if val is not None:
+            print(f"{key}|{val}")
+
+    if rl.get("error"):
+        print(f"error|{rl['error']}")
+
+    headers = rl.get("headers")
+    if isinstance(headers, dict):
+        print("headers_begin|1")
+        for hk, hv in headers.items():
+            print(f"header|{hk}: {hv}")
+        print("headers_end|1")
+
+
+# ---------------------------------------------------------------------
+# Data fetchers – devices list, radio-information, active clients
+# ---------------------------------------------------------------------
+def get_devices(
+    base_url: str,
+    token: str,
+    timeout: int,
+    verify: bool,
+    proxy: Optional[str],
+) -> Tuple[str, Optional[List[Dict[str, Any]]]]:
+    devices: List[Dict[str, Any]] = []
+    page = 1
+
+    base_params = {
+        "limit": 100,
+        "order": "ASC",
+        "views": "FULL",
+        "deviceTypes": "REAL",
+        "async": "false",
+    }
+
+    while True:
+        params = dict(base_params)
+        params["page"] = page
+
+        status, data_json, _ = api_request_json(
+            base_url, "/devices", token, timeout, verify, proxy, params=params
+        )
+
+        if status == "RELOGIN":
+            return "RELOGIN", None
+        if status != "OK":
+            return "ERROR", None
+
+        chunk = data_json.get("data", []) if isinstance(data_json, dict) else []
+        if not chunk:
+            break
+
+        devices.extend(chunk)
+
+        if len(chunk) < base_params["limit"]:
+            break
+
+        page += 1
+        if page > 10000:
+            break
+
+    return "OK", devices
+
+
+def _extract_radios_from_payload(payload: Any, device_id: Any) -> List[Dict[str, Any]]:
+    did = str(device_id)
+    out: List[Dict[str, Any]] = []
+    if not payload:
+        return out
+
+    # { "data": [ { "device_id": ..., "radios": [...] }, ... ] }
+    if isinstance(payload, dict) and isinstance(payload.get("data"), list):
+        for entry in payload.get("data") or []:
+            try:
+                if str(entry.get("device_id")) == did:
+                    out.extend(entry.get("radios", []) or [])
+            except Exception:
+                continue
+        if out:
+            return out
+
+    # [ { "device_id": ..., "radios": [...] }, ... ]
+    if isinstance(payload, list):
+        for entry in payload:
+            try:
+                if str(entry.get("device_id")) == did:
+                    out.extend(entry.get("radios", []) or [])
+            except Exception:
+                continue
+
+    return out
+
+
+def get_radio_information_for_device(
+    base_url: str,
+    token: str,
+    timeout: int,
+    verify: bool,
+    proxy: Optional[str],
+    device_id: int,
+) -> List[Dict[str, Any]]:
+    """
+    Attempts:
+      1. /devices/radio-information?deviceIds=<id>&page=1&limit=50&async=false (fail-fast 5s)
+      2. /devices/radio-information?deviceIds=<id>&async=false
+      3. /devices/<id>/radio-information?async=false
+    """
+    # 1) Fail-fast
+    try:
+        status, payload, _ = api_request_json(
+            base_url,
+            "/devices/radio-information",
+            token,
+            timeout=5,
+            verify=verify,
+            proxy=proxy,
+            params={"deviceIds": str(device_id), "page": 1, "limit": 50, "async": "false"},
+        )
+        if status == "RELOGIN":
+            return [{"_error": "RELOGIN"}]
+        if status == "OK":
+            radios = _extract_radios_from_payload(payload, device_id)
+            if radios:
+                return radios
+    except Exception:
+        pass
+
+    # 2) Unpaged
+    status, payload, _ = api_request_json(
+        base_url,
+        "/devices/radio-information",
+        token,
+        timeout,
+        verify,
+        proxy,
+        params={"deviceIds": str(device_id), "async": "false"},
+    )
+    if status == "RELOGIN":
+        return [{"_error": "RELOGIN"}]
+    if status == "OK":
+        radios = _extract_radios_from_payload(payload, device_id)
+        if radios:
+            return radios
+
+    # 3) Per-device path
+    status, payload, _ = api_request_json(
+        base_url,
+        f"/devices/{device_id}/radio-information",
+        token,
+        timeout,
+        verify,
+        proxy,
+        params={"async": "false"},
+    )
+    if status == "RELOGIN":
+        return [{"_error": "RELOGIN"}]
+    if status == "OK":
+        radios = _extract_radios_from_payload(payload, device_id)
+        if radios:
+            return radios
+
+    return []
+
+
+def _band_failsafe_from_client(c: dict) -> str:
+    """Return one of: '2.4GHz', '5GHz', '6GHz'."""
+    try:
+        b = norm_band_from_active_client(c)
+        if b in ("2.4GHz", "5GHz", "6GHz"):
+            return b
+    except Exception:
+        pass
+
+    # channel fallback
+    try:
+        ch = int(c.get("channel") or 0)
+    except Exception:
+        ch = 0
+    if 1 <= ch <= 14:
+        return "2.4GHz"
+    if (36 <= ch <= 64) or (100 <= ch <= 144) or (149 <= ch <= 165):
+        return "5GHz"
+
+    # 6 GHz rough heuristic
+    txt = f"{c.get('radio_type','')} {c.get('mac_protocol','')}".lower()
+    if "6" in txt or "6g" in txt or "eht" in txt:
+        return "6GHz"
+    return "5GHz"
+
+
+def get_active_clients_for_devices_batched(
+    base_url: str,
+    token: str,
+    timeout: int,
+    verify: bool,
+    proxy: Optional[str],
+    device_ids: List[int],
+    batch_size: int = 30,
+    max_pages: int = 10,
+    page_limit: int = 100,
+    views: str = "FULL",
+    sort_order: str = "ASC",
+) -> Tuple[str, Dict[int, Dict[str, Dict[str, int]]]]:
+    """
+    Fetch active clients via GET /clients/active with repeated deviceIds parameters.
+
+    Returns:
+      ("OK", { device_id: { ssid: { "2.4GHz": n, "5GHz": n, "6GHz": n } } })
+      or ("RELOGIN", {}) on 401.
+    """
+    result: Dict[int, Dict[str, Dict[str, int]]] = {int(d): {} for d in device_ids}
+
+    def batches(lst: List[int], n: int) -> Iterable[List[int]]:
+        for i in range(0, len(lst), max(1, n)):
+            yield lst[i : i + max(1, n)]
+
+    for batch in batches(device_ids, batch_size):
+        page = 1
+        while True:
+            params_list: List[Tuple[str, Any]] = [
+                ("page", page),
+                ("limit", page_limit),
+                ("views", views),
+                ("sortOrder", sort_order),
+                ("clientConnectionTypes", "1"),
+                ("excludeLocallyManaged", "false"),
+            ]
+            for did in batch:
+                params_list.append(("deviceIds", str(did)))
+
+            status, data, _ = api_request_json(
+                base_url,
+                "/clients/active",
+                token,
+                timeout,
+                verify,
+                proxy,
+                method="GET",
+                params=params_list,
+            )
+            if status == "RELOGIN":
+                return "RELOGIN", {}
+            if status != "OK" or not data:
+                break
+
+            items = data.get("data") if isinstance(data, dict) else (data if isinstance(data, list) else [])
+            if not items:
+                break
+
+            for c in items:
+                try:
+                    did_raw = c.get("device_id") or c.get("deviceId") or c.get("ap_id")
+                    if did_raw is None:
+                        continue
+                    did = int(did_raw)
+                    if did not in result:
+                        continue
+                    ssid = (c.get("ssid") or "").strip()
+                    if not ssid:
+                        continue
+                    band = _band_failsafe_from_client(c)
+                    if band not in ("2.4GHz", "5GHz", "6GHz"):
+                        band = "5GHz"
+                    if ssid not in result[did]:
+                        result[did][ssid] = {"2.4GHz": 0, "5GHz": 0, "6GHz": 0}
+                    result[did][ssid][band] += 1
+                except Exception:
+                    continue
+
+            total_pages = data.get("total_pages") if isinstance(data, dict) else None
+            if total_pages is not None:
+                if page >= total_pages:
+                    break
+            else:
+                if len(items) < page_limit:
+                    break
+            page += 1
+
+    return "OK", result
+
+
+# ---------------------------------------------------------------------
+# Output helpers – print piggyback and H1 sections
+# ---------------------------------------------------------------------
+def _print_piggy_ap(
+    dev: Dict[str, Any],
+    dev_id: int,
+    ssid_freq: Dict[str, Dict[str, int]],
+    radio_list: List[Dict[str, Any]],
+) -> Tuple[int, int, int, int]:
+    """
+    Print all piggyback sections for a single AP and return (total, c24, c5, c6).
+    """
+    hostname = dev.get("hostname") or dev.get("serial_number") or "unknown"
+    serial = dev.get("serial_number", "")
+    mac = format_mac(dev.get("mac_address", ""))
+    ip = dev.get("ip_address", "")
+    model = dev.get("product_type", "")
+    sw = dev.get("software_version") or dev.get("display_version") or ""
+    connected = bool(dev.get("connected", False))
+    uptime = _safe_int(dev.get("system_up_time"), 0)
+
+    # Locations (full + leaf)
+    locs = dev.get("locations") or []
+    parts: List[str] = []
+    for entry in locs:
+        if isinstance(entry, str):
+            parts.append(entry.strip())
+        elif isinstance(entry, dict):
+            n = entry.get("name") or entry.get("path") or ""
+            if n:
+                parts.append(n.strip())
+    full_location = " / ".join(parts)
+    leaf_location = _shorten_location(locs)
+
+    # LLDP short preview
+    lldp_infos = dev.get("lldp_cdp_infos") or []
+    if isinstance(lldp_infos, dict):
+        lldp_infos = [lldp_infos]
+    lldp_short = ""
+    if lldp_infos:
+        info0 = lldp_infos[0] or {}
+        sysname = _clean_text(info0.get("system_name", ""))
+        portid = _clean_text(info0.get("port_id", ""))
+        if sysname or portid:
+            lldp_short = f"{sysname}/{portid}"
+
+    # Per-AP client totals from ssid_freq
+    ap_24 = sum(d.get("2.4GHz", 0) for d in ssid_freq.values())
+    ap_5 = sum(d.get("5GHz", 0) for d in ssid_freq.values())
+    ap_6 = sum(d.get("6GHz", 0) for d in ssid_freq.values())
+    ap_total = ap_24 + ap_5 + ap_6
+
+    # ---- PIGGYBACK HEADER ----
+    print(f"<<<<{hostname}>>>>")
+
+    # labels
+    print("<<<labels:sep(0)>>>")
+    print(json.dumps({
+        "xIq/device_type": "ap",
+        "xIq/model": model,
+        "xIq/location": leaf_location,
+        "xIq/connectivity": "CONNECTED" if connected else "DISCONNECTED",
+    }, ensure_ascii=False))
+
+    # host attributes
+    print("<<<cmk_host_attributes:sep(0)>>>")
+    if ip:
+        print(f"ipaddress={ip}")
+    print(f"alias={hostname} (XIQ)")
+    print("tag_piggyback=yes")
+    print("tag_xiq_ap=yes")
+    print(f"tag_Location={leaf_location}")
+
+    # AP Status
+    print("<<<extreme_ap_status:sep(124)>>>")
+    print(
+        f"{hostname}|{serial}|{mac}|{ip}|{model}|"
+        f"{1 if connected else 0}|"
+        f"{'CONNECTED' if connected else 'DISCONNECTED'}|"
+        f"{sw}|{uptime}|{full_location}|{lldp_short}"
+    )
+
+    # AP band client totals (legacy counts section)
+    print("<<<extreme_ap_clients:sep(124)>>>")
+    print(f"{ap_24}|{ap_5}|{ap_6}")
+
+    # AP neighbors
+    print("<<<extreme_ap_neighbors:sep(124)>>>")
+    for n in lldp_infos:
+        local_port = _clean_text(n.get("interface_name", ""))
+        remote_dev = _clean_text(n.get("system_name", ""))
+        mgmt_ip = _clean_text(n.get("management_ip", ""))
+        remote_port = _clean_text(n.get("port_id", ""))
+        port_desc = _clean_text(n.get("port_description", ""))
+        mac_addr = format_mac(_clean_text(n.get("system_id", "")))
+        print(
+            f"{dev_id}|{hostname}|{ip}|{local_port}|{mgmt_ip}|"
+            f"{remote_port}|{port_desc}|{mac_addr}|{remote_dev}"
+        )
+
+    # radio info JSON
+    print("<<<xiq_radio_information:json>>>")
+    print(json.dumps({
+        "device_id": dev_id,
+        "hostname": hostname,
+        "radios": radio_list or [],
+        "_ssid_freq": ssid_freq,
+    }, ensure_ascii=False))
+
+    # active clients for inventory (details + summary)
+    ap_clients: List[Dict[str, Any]] = []
+    try:
+        params_list = [
+            ("page", 1),
+            ("limit", 100),
+            ("views", "FULL"),
+            ("sortOrder", "ASC"),
+            ("clientConnectionTypes", "1"),
+            ("excludeLocallyManaged", "false"),
+            ("deviceIds", str(dev_id)),
+        ]
+        status_cli_inv, data_cli_inv, _ = api_request_json(
+            args.url, "/clients/active", token, args.timeout, verify, args.proxy,
+            method="GET", params=params_list
+        )
+        if status_cli_inv == "RELOGIN":
+            # re-login on demand
+            new_token = api_login(args.url, args.username, args.password, args.timeout, verify, args.proxy, cachefile)
+            status_cli_inv, data_cli_inv, _ = api_request_json(
+                args.url, "/clients/active", new_token, args.timeout, verify, args.proxy,
+                method="GET", params=params_list
+            )
+            # Update outer token if relogin worked
+            if status_cli_inv == "OK":
+                token_holder["val"] = new_token
+
+        if status_cli_inv == "OK" and isinstance(data_cli_inv, dict):
+            for c in data_cli_inv.get("data") or []:
+                try:
+                    if int(c.get("device_id")) != dev_id:
+                        continue
+                except Exception:
+                    continue
+
+                ap_clients.append({
+                    "id": c.get("id"),
+                    "hostname": c.get("hostname") or "",
+                    "mac": format_mac(c.get("mac_address") or ""),
+                    "ip": c.get("ip_address") or "",
+                    "ssid": c.get("ssid") or "",
+                    "band": norm_band_from_active_client(c),
+                    "bssid": format_mac(c.get("bssid") or ""),
+                    "rssi": _safe_int(c.get("rssi"), 0),
+                    "snr": _safe_int(c.get("snr"), 0),
+                    "channel": _safe_int(c.get("channel"), 0),
+                    "ap_name": c.get("device_name") or hostname,
+                    "ap_id": c.get("device_id"),
+                    "os_type": c.get("os_type") or "",
+                    "user_profile": c.get("user_profile_name") or "",
+                    "connected": bool(c.get("connected", False)),
+                })
+    except Exception:
+        pass
+
+    print("<<<xiq_active_clients:json>>>")
+    print(json.dumps({
+        "device_id": dev_id,
+        "hostname": hostname,
+        "summary": {
+            "total": ap_total,
+            "band": {"2.4GHz": ap_24, "5GHz": ap_5, "6GHz": ap_6},
+            "per_ssid": ssid_freq,
+        },
+        "clients": ap_clients,
+    }, ensure_ascii=False))
+
+    print("<<<<>>>>")  # piggyback end
+    return ap_total, ap_24, ap_5, ap_6
+
+
+# ---------------------------------------------------------------------
+# MAIN – glue all pieces together
+# ---------------------------------------------------------------------
+def main():
+    global args, token, verify, cachefile, token_holder  # for nested relogin use
+    args = parse_args()
+    verify = not args.no_cert_check
+    cachefile = _cache_path(args.host)
+
+    # Token (cached 1h)
+    token = _cache_load(cachefile)
+    if not token:
+        try:
+            token = api_login(
+                args.url, args.username, args.password, args.timeout, verify, args.proxy, cachefile
+            )
+        except Exception as e:
+            print("<<<extreme_cloud_iq_login>>>")
+            print(f"STATUS:FAILED CODE:ERROR RESPONSE:{e}")
+            print_rate_limits_section({"state": "NO_RESPONSE"})
+            sys.exit(0)
+
+    # Rate-limit handshake
+    try:
+        ok_rl, rl_data = fetch_rate_limits(args.url, token, args.timeout, verify, args.proxy)
+    except Exception as e:
+        ok_rl, rl_data = False, {"state": "NO_RESPONSE", "error": str(e)}
+
+    if rl_data.get("state") == "RELOGIN":
+        try:
+            token = api_login(
+                args.url, args.username, args.password, args.timeout, verify, args.proxy, cachefile
+            )
+            ok_rl, rl_data = fetch_rate_limits(args.url, token, args.timeout, verify, args.proxy)
+        except Exception as e:
+            print("<<<extreme_cloud_iq_login>>>")
+            print(f"STATUS:FAILED CODE:ERROR RESPONSE:{e}")
+            print_rate_limits_section({"state": "NO_RESPONSE"})
+            sys.exit(0)
+
+    print_rate_limits_section(rl_data)
+
+    # Devices
+    status, devices = get_devices(args.url, token, args.timeout, verify, args.proxy)
+    if status == "RELOGIN":
+        token = api_login(
+            args.url, args.username, args.password, args.timeout, verify, args.proxy, cachefile
+        )
+        status, devices = get_devices(args.url, token, args.timeout, verify, args.proxy)
+
+    if status != "OK" or devices is None:
+        print("<<<extreme_cloud_iq_login>>>")
+        print("STATUS:FAILED CODE:ERROR RESPONSE:Device fetch failed")
+        sys.exit(0)
+
+    # Mark login OK
+    print("<<<extreme_cloud_iq_login>>>")
+    print("STATUS:OK CODE:200 RESPONSE:Token valid and data fetched")
+
+    # Collect AP candidates
+    ap_candidates: List[Dict[str, Any]] = []
+    ap_ids: List[int] = []
+
+    for dev in devices:
+        fun = str(dev.get("device_function", "")).upper()
+        mby = str(dev.get("managed_by", "")).upper()
+        if fun == "AP" and mby == "XIQ" and dev.get("connected", False):
+            ap_candidates.append(dev)
+            try:
+                ap_ids.append(int(dev.get("id")))
+            except Exception:
+                pass
+
+    # Multi-device active clients (per-AP SSID-band counters)
+    status_cli, all_ssid_freq = get_active_clients_for_devices_batched(
+        args.url,
+        token,
+        args.timeout,
+        verify,
+        args.proxy,
+        ap_ids,
+        batch_size=args.clients_batch_size,
+        max_pages=args.clients_max_pages,
+        page_limit=args.clients_page_limit,
+        views=args.clients_views,
+        sort_order=args.clients_sort_order,
+    )
+    if status_cli == "RELOGIN":
+        token = api_login(
+            args.url, args.username, args.password, args.timeout, verify, args.proxy, cachefile
+        )
+        status_cli, all_ssid_freq = get_active_clients_for_devices_batched(
+            args.url,
+            token,
+            args.timeout,
+            verify,
+            args.proxy,
+            ap_ids,
+            batch_size=args.clients_batch_size,
+            max_pages=args.clients_max_pages,
+            page_limit=args.clients_page_limit,
+            views=args.clients_views,
+            sort_order=args.clients_sort_order,
+        )
+
+    # Print piggyback per AP
+    ap_count = 0
+    sum_clients_24 = 0
+    sum_clients_5 = 0
+    sum_clients_6 = 0
+    sum_clients_total = 0
+
+    # Token holder for nested relogin inside piggyback section fetches
+    token_holder = {"val": token}
+
+    for dev in ap_candidates:
+        ap_count += 1
+        dev_id = int(dev.get("id"))
+
+        # Radio info with relogin fallback
+        radio_list = get_radio_information_for_device(
+            args.url, token_holder["val"], args.timeout, verify, args.proxy, dev_id
+        )
+        if isinstance(radio_list, list) and radio_list and \
+           isinstance(radio_list[0], dict) and radio_list[0].get("_error") == "RELOGIN":
+            new_token = api_login(args.url, args.username, args.password, args.timeout, verify, args.proxy, cachefile)
+            token_holder["val"] = new_token
+            radio_list = get_radio_information_for_device(
+                args.url, new_token, args.timeout, verify, args.proxy, dev_id
+            )
+
+        ssid_freq = all_ssid_freq.get(dev_id, {})
+
+        ap_total, ap_24, ap_5, ap_6 = _print_piggy_ap(dev, dev_id, ssid_freq, radio_list)
+
+        sum_clients_24 += ap_24
+        sum_clients_5 += ap_5
+        sum_clients_6 += ap_6
+        sum_clients_total += ap_total
+
+    # SUMMARY SECTION (H1)
+    print("<<<extreme_summary:sep(124)>>>")
+    print(f"access_points|{ap_count}")
+    print(f"total_clients|{sum_clients_total}")
+    print(f"clients_24|{sum_clients_24}")
+    print(f"clients_5|{sum_clients_5}")
+    print(f"clients_6|{sum_clients_6}")
+
+    # DEVICE INVENTORY (H1)
+    print("<<<extreme_device_inventory:sep(124)>>>")
+    for dev in devices:
+        dev_id     = dev.get("id", "")
+        hostname   = dev.get("hostname") or dev.get("serial_number", "unknown")
+        serial     = dev.get("serial_number", "")
+        mac        = format_mac(dev.get("mac_address", ""))
+        ip         = dev.get("ip_address", "")
+        model      = dev.get("product_type", "")
+        sw         = dev.get("software_version") or dev.get("display_version") or ""
+        dev_fun    = (dev.get("device_function", "") or "").upper() or "UNKNOWN"
+        managed_by = dev.get("managed_by", "XIQ")
+        connected  = bool(dev.get("connected", False))
+
+        locs = dev.get("locations") or []
+        parts: List[str] = []
+        for e in locs:
+            if isinstance(e, str):
+                parts.append(e.strip())
+            elif isinstance(e, dict):
+                n = e.get("name") or e.get("path") or ""
+                if n:
+                    parts.append(n.strip())
+        full_location = " / ".join(p for p in parts if p)
+
+        print(
+            f"{dev_id}|{hostname}|{serial}|{mac}|{ip}|{model}|{sw}|"
+            f"{full_location}|{dev_fun}|{managed_by}|{1 if connected else 0}"
+        )
+
+    # LLDP/CDP NEIGHBORS (H1)
+    print("<<<extreme_device_neighbors:sep(124)>>>")
+    for dev in devices:
+        dev_id   = dev.get("id", "")
+        hostname = dev.get("hostname") or dev.get("serial_number", "unknown")
+        host_ip  = dev.get("ip_address", "")
+
+        neigh_list = dev.get("lldp_cdp_infos") or []
+        if isinstance(neigh_list, dict):
+            neigh_list = [neigh_list]
+
+        for n in neigh_list:
+            local_port    = _clean_text(n.get("interface_name", ""))
+            remote_device = _clean_text(n.get("system_name", ""))
+            management_ip = _clean_text(n.get("management_ip", ""))
+            remote_port   = _clean_text(n.get("port_id", ""))
+            port_desc     = _clean_text(n.get("port_description", ""))
+            mac_address   = format_mac(_clean_text(n.get("system_id", "")))
+
+            print(
+                f"{dev_id}|{hostname}|{host_ip}|{local_port}|{management_ip}|"
+                f"{remote_port}|{port_desc}|{mac_address}|{remote_device}"
+            )
+
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

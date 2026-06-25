@@ -1,0 +1,11 @@
+title: xiq_devices
+agents: piggyback
+catalog: custom/xiq
+license: GPLv2
+distribution: check_mk
+description:
+ This man page was auto-generated for plugin 'xiq_devices'.
+ Please update this description manually.
+
+discovery:
+ One service or inventory entry is created.
