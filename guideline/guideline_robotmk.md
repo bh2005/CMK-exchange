@@ -658,3 +658,46 @@ cmk -I --detect-plugins=robotmk <TEST-HOST>
 ---
 
 *Author: bh2005 | License: GPL v2*
+
+---
+
+## CMK 2.5 – Änderungen für Robotmk
+
+### 1. Edition-Umbenennung
+
+Robotmk ist ausschließlich in der kommerziellen Edition verfügbar. Die Bezeichnung hat sich in CMK 2.5 geändert:
+
+| CMK 2.4 | CMK 2.5 |
+|---|---|
+| **CEE** (Checkmk Enterprise Edition) | **Pro** |
+| **CCE** (Checkmk Cloud Edition) | **Ultimate** |
+
+→ Alle Hinweise in dieser Guideline auf „CEE" gelten in CMK 2.5 für die **Pro**-Edition.
+
+### 2. Robotmk-Version in CMK 2.5
+
+CMK 2.5 enthält Robotmk in einer aktualisierten Version. Die grundlegende Architektur (Scheduler → Plans → Tests) ist unverändert. Folgende Punkte sind bei einem Upgrade zu beachten:
+
+- Der **Robotmk Scheduler** wird automatisch über die Bakery-Regel mit dem neuen Agent-Paket ausgerollt
+- Bestehende **Plan-Definitionen** und **Suite-Pfade** bleiben kompatibel
+- Die **Service-Namen** (`RMK Scheduler`, `RMK Plan`, `RMK Test`) ändern sich nicht
+
+### 3. Agent-Bakery: Neue Regel-Pfade
+
+In CMK 2.5 liegen Bakery-Plugins im `cmk_addons`-Pfad. Falls Robotmk-spezifische Bakery-Erweiterungen als MKP genutzt werden:
+
+```text
+# CMK 2.4:
+~/local/lib/python3/cmk/base/cee/plugins/bakery/
+
+# CMK 2.5:
+~/local/lib/python3/cmk_addons/plugins/<name>/bakery/
+```
+
+### 4. Empfehlung für das Upgrade
+
+1. CMK-Server auf 2.5 upgraden (OMD-Update)
+2. Robotmk-Bakery-Regel bleibt erhalten — Agent-Pakete werden automatisch neu gebaut
+3. Linux Test-Hosts erhalten beim nächsten Agent-Update die neue Robotmk-Version
+4. Bestehende Test-Suites und Robot-Framework-Projekte sind ohne Anpassung weiterhin kompatibel
+5. `RCC holotree` Environments werden beim ersten Lauf neu gebaut (kurze Downtime der Synthetic-Tests einplanen)

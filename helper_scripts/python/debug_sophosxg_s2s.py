@@ -3,6 +3,7 @@
 """
 CHECKMK PLUGIN REGISTRATION DEBUGGER – speziell für sophosxg_s2s
 Prüft, ob der Check korrekt geladen und registriert wurde
+Kompatibel mit CMK 2.4 und 2.5 (prüft beide Plugin-Pfade)
 """
 
 import importlib
@@ -18,40 +19,61 @@ print("=" * 90)
 print(f"Run at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 print()
 
-# =====================================================================
-# Konfiguration – Pfad zum lokalen Plugin-Verzeichnis
-# =====================================================================
-
-PLUGIN_DIR = Path(os.environ.get("OMD_ROOT", "")) / "local" / "lib" / "python3" / "cmk" / "base" / "plugins" / "agent_based"
-
-if not PLUGIN_DIR.exists():
-    print(f"FEHLER: Plugin-Verzeichnis nicht gefunden: {PLUGIN_DIR}")
+OMD_ROOT = os.environ.get("OMD_ROOT", "")
+if not OMD_ROOT:
+    print("FEHLER: OMD_ROOT Umgebungsvariable nicht gesetzt!")
     print("→ Prüfen Sie, ob Sie als Site-Benutzer eingeloggt sind (omd su <site>)")
     sys.exit(1)
 
-PLUGIN_FILE = PLUGIN_DIR / "sophosxg_s2s.py"
-
 # =====================================================================
-# Hauptprüfung
+# Konfiguration – Plugin-Pfade für CMK 2.4 und 2.5
+# CMK 2.4: cmk/base/plugins/agent_based/
+# CMK 2.5: cmk_addons/plugins/<name>/agent_based/  (MKP-Pfad)
+#           cmk/base/plugins/agent_based/            (weiterhin gültig für Site-Installs)
 # =====================================================================
 
-print(f"Scanning directory: {PLUGIN_DIR}")
-print()
+CANDIDATES = [
+    # CMK 2.5 MKP-Pfad (empfohlen)
+    (
+        Path(OMD_ROOT) / "local" / "lib" / "python3" / "cmk_addons" / "plugins" / "sophosxg" / "agent_based",
+        "cmk_addons.plugins.sophosxg.agent_based.sophosxg_s2s",
+        "CMK 2.5 MKP-Pfad",
+    ),
+    # CMK 2.4 / Standalone-Pfad (weiterhin gültig in 2.5)
+    (
+        Path(OMD_ROOT) / "local" / "lib" / "python3" / "cmk" / "base" / "plugins" / "agent_based",
+        "cmk.base.plugins.agent_based.sophosxg_s2s",
+        "CMK 2.4 Standalone-Pfad",
+    ),
+]
 
-if not PLUGIN_FILE.exists():
-    print(f"✗ Datei nicht gefunden: {PLUGIN_FILE}")
-    print("→ Plugin muss heißen: sophosxg_s2s.py")
-    print("→ Und im Verzeichnis liegen: local/lib/python3/cmk/base/plugins/agent_based/")
+PLUGIN_DIR = None
+module_name = None
+
+for candidate_dir, candidate_module, label in CANDIDATES:
+    candidate_file = candidate_dir / "sophosxg_s2s.py"
+    if candidate_file.exists():
+        PLUGIN_DIR = candidate_dir
+        module_name = candidate_module
+        print(f"→ Datei gefunden ({label}):")
+        print(f"  {candidate_file}")
+        print()
+        break
+
+if PLUGIN_DIR is None:
+    print("✗ Plugin-Datei nicht gefunden!")
+    print()
+    print("Gesuchte Pfade:")
+    for candidate_dir, _, label in CANDIDATES:
+        print(f"  [{label}] {candidate_dir / 'sophosxg_s2s.py'}")
+    print()
+    print("→ CMK 2.5 (MKP): local/lib/python3/cmk_addons/plugins/sophosxg/agent_based/sophosxg_s2s.py")
+    print("→ CMK 2.4:       local/lib/python3/cmk/base/plugins/agent_based/sophosxg_s2s.py")
     sys.exit(1)
-
-print(f"→ Datei gefunden: {PLUGIN_FILE}")
-print()
 
 # =====================================================================
 # Modul importieren und prüfen
 # =====================================================================
-
-module_name = "cmk.base.plugins.agent_based.sophosxg_s2s"
 
 print(f"Versuche Import: {module_name}")
 
@@ -64,23 +86,21 @@ except Exception as e:
     print()
     print("Mögliche Ursachen:")
     print("  - Syntaxfehler im Plugin")
-    print("  - Falsche Imports (cmk.agent_based.v2 statt v1)")
+    print("  - Falsche Imports (v1 statt v2: 'from cmk.agent_based.v2 import ...')")
     print("  - Dateiname oder Modulname falsch")
     sys.exit(1)
 
 # =====================================================================
-# Prüfen der registrierten Objekte
+# Prüfen der registrierten Objekte (CMK v2 API: Variablennamen)
 # =====================================================================
 
 print()
-print("Prüfe Registrierungen...")
+print("Prüfe Registrierungen (CMK agent_based v2 API)...")
 
 found_section = False
 found_plugin = False
 
-# Prüfen auf snmp_section_*
 for name in dir(module):
-    obj = getattr(module, name)
     if name == "snmp_section_sophosxg_s2s":
         found_section = True
         print("✓ SNMP-Section gefunden: snmp_section_sophosxg_s2s")
@@ -90,11 +110,15 @@ for name in dir(module):
 
 if not found_section:
     print("✗ Keine snmp_section_sophosxg_s2s gefunden!")
-    print("→ Muss exakt so heißen und mit register.snmp_section(...) registriert sein")
+    print("→ CMK v2 API: Variable muss so heißen:")
+    print("    snmp_section_sophosxg_s2s = SNMPSection(name='sophosxg_s2s', ...)")
+    print("→ CMK v1 API (veraltet): register.snmp_section(name='sophosxg_s2s', ...)")
 
 if not found_plugin:
     print("✗ Kein check_plugin_sophosxg_s2s gefunden!")
-    print("→ Muss exakt so heißen und mit register.check_plugin(...) registriert sein")
+    print("→ CMK v2 API: Variable muss so heißen:")
+    print("    check_plugin_sophosxg_s2s = CheckPlugin(name='sophosxg_s2s', ...)")
+    print("→ CMK v1 API (veraltet): register.check_plugin(name='sophosxg_s2s', ...)")
 
 # =====================================================================
 # Zusammenfassung
@@ -108,15 +132,15 @@ print("=" * 60)
 if found_section and found_plugin:
     print("✓ Beide Komponenten erfolgreich registriert")
     print("→ Das Plugin sollte jetzt in Checkmk sichtbar sein")
-    print("→ Nächster Schritt: omd reload apache")
+    print("→ Nächster Schritt: omd reload apache  (oder: cmk -R)")
     print("→ Dann: Agent neu ausführen → Services suchen nach 'S2S Tunnel'")
 else:
     print("✗ Mindestens eine Komponente fehlt oder ist falsch registriert")
-    print("→ Bitte Plugin-Code prüfen (Name, register-Aufruf, Imports)")
+    print("→ Bitte Plugin-Code prüfen (Variablenname, Imports, Syntax)")
     print("→ Häufige Fehler:")
-    print("   - Falscher Klassen-/Variablenname")
-    print("   - register.check_plugin() fehlt")
-    print("   - Syntaxfehler vor der Registrierung")
+    print("   - Variablenname stimmt nicht mit check_plugin_sophosxg_s2s überein")
+    print("   - Falscher Import-Pfad (v1 statt v2)")
+    print("   - Syntaxfehler vor der Variablendefinition")
 
 print()
 print("Debug beendet.")

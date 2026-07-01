@@ -243,3 +243,102 @@ rule_spec_my_device_stats_levels = CheckParameters(
 4. Service Discovery (`cmk -I hostname`)
 5. Prüfen: `cmk -n hostname | grep mein_snmp_check`
 
+---
+
+## CMK 2.5 – Breaking Changes & Migration
+
+### 1. API-Version: `v1` → `v2` empfohlen
+
+`cmk.agent_based.v1` funktioniert in CMK 2.5 noch, ist aber deprecated. Neue Checks sollten `v2` verwenden. Die wichtigsten Unterschiede:
+
+```python
+# CMK 2.4 (v1 – noch funktionsfähig, aber veraltet):
+from cmk.agent_based.v1 import (
+    register,
+    SNMPTree, contains,
+    Service, Result, State, Metric, render,
+    get_rate, GetRateError,
+)
+
+register.snmp_section(name="my_check", ...)
+register.check_plugin(name="my_check", ...)
+
+# CMK 2.5 (v2 – empfohlen):
+from cmk.agent_based.v2 import (
+    AgentSection, CheckPlugin, SNMPSection, SNMPTree,
+    contains, all_of, any_of,
+    Service, Result, State, Metric, render,
+    get_rate, GetRateError, StringTable,
+)
+
+# v2: Deklarativer Stil statt register.*
+snmp_section_my_check = SNMPSection(
+    name="my_check",
+    parse_function=parse_my_check,
+    fetch=SNMPTree(base=".1.3.6.1.4.1.12345", oids=["1", "2"]),
+    detect=contains(".1.3.6.1.2.1.1.1.0", "MyDevice"),
+)
+
+check_plugin_my_check = CheckPlugin(
+    name="my_check",
+    service_name="My Check %s",
+    discovery_function=discover_my_check,
+    check_function=check_my_check,
+)
+```
+
+### 2. `get_rate` – Signaturänderung in v2
+
+```python
+# v1:
+rate = get_rate(section_name="my_check", key=f"{item}_counter",
+                this_time=time.time(), this_val=data["counter"])
+
+# v2 (value_store statt section_name):
+from cmk.agent_based.v2 import get_rate, GetRateError
+from cmk.agent_based.v2 import get_value_store
+
+def check_my_check(item, params, section):
+    value_store = get_value_store()
+    rate = get_rate(value_store, f"{item}.counter", time.time(), data["counter"])
+```
+
+### 3. Datei-Ort für MKP-kompatible Checks
+
+```text
+# CMK 2.4 (Standalone-Checks):
+~/local/lib/python3/cmk/base/plugins/agent_based/
+
+# CMK 2.5 (MKP / cmk_addons):
+~/local/lib/python3/cmk_addons/plugins/<pluginname>/agent_based/my_check.py
+```
+
+### 4. Graphing: `color`-Modul entfernt
+
+Falls der SNMP-Check eigene Metriken definiert:
+
+```python
+# CMK 2.4 (ALT):
+from cmk.graphing.v1 import metrics, color
+color=color.GREEN,
+
+# CMK 2.5 (NEU):
+from cmk.graphing.v1 import metrics
+color=metrics.Color.GREEN,
+# GREY → GRAY (Umbenennung!)
+```
+
+### 5. Rulesets: Imports unverändert
+
+`cmk.rulesets.v1` (inkl. `CheckParameters`, `HostAndItemCondition`, `Float`, `validators.NumberInRange`) ist in CMK 2.5 unverändert gültig.
+
+### Schnell-Checkliste Migration 2.4 → 2.5
+
+- [ ] `cmk.agent_based.v1` → `v2` (oder zumindest Warnung im MKP-Header dokumentieren)
+- [ ] `register.snmp_section(…)` → `SNMPSection(…)` Variable
+- [ ] `register.check_plugin(…)` → `CheckPlugin(…)` Variable
+- [ ] `get_rate`: `section_name=` → `value_store=get_value_store()`
+- [ ] Graphing: `color.X` → `metrics.Color.X`, `GREY` → `GRAY`
+- [ ] MKP: Dateipfad auf `cmk_addons/plugins/<name>/agent_based/` prüfen
+- [ ] MKP: `version.min_required` auf `"2.5.0p1"` setzen
+

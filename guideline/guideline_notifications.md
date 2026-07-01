@@ -172,10 +172,102 @@ if __name__ == "__main__":
 ### 6. Wo weitere Beispiele & Inspiration finden?
 
 - Offizielles Repo: `notifications/` Verzeichnis (z. B. `mail.py`, `ascii_mail.py`)
-- Community-Repos (suche GitHub nach „checkmk notification“):
+- Community-Repos (suche GitHub nach „checkmk notification”):
   - SIGNL4
   - Matrix
   - Telegram
   - ntfy.sh
   - Teams (mehrere Varianten)
-- YouTube → „Checkmk Conference notification plugin“ (Ron Czachara – SIGNL4 Session 2024/25)
+- YouTube → „Checkmk Conference notification plugin” (Ron Czachara – SIGNL4 Session 2024/25)
+
+---
+
+## CMK 2.5 – Breaking Changes & Migration
+
+### 1. Neue `NotificationPlugin`-API (empfohlen ab 2.5)
+
+CMK 2.5 führt eine neue deklarative API für Notification-Plugins ein, analog zu den anderen Plugin-Typen. Das alte Script-Format (`~/local/share/check_mk/notifications/`) funktioniert weiterhin, die neue API ist aber der empfohlene Weg für neue Plugins.
+
+```python
+# CMK 2.5 – neue NotificationPlugin-API
+# Datei: ~/local/lib/python3/cmk_addons/plugins/<name>/notification_scripts/<name>.py
+
+from cmk.notification_plugins.v1 import (
+    NotificationPlugin,
+    NotificationContext,
+    notification_plugin_registry,
+)
+
+def notify(context: NotificationContext) -> int:
+    “””
+    context enthält alle Notification-Variablen als typisiertes Objekt.
+    Rückgabe: 0 = Erfolg, 2 = Fehler
+    “””
+    hostname = context.host_name
+    service  = context.service_description or “”
+    state    = context.service_state or context.host_state
+    output   = context.service_output or context.host_output
+
+    # Deine Benachrichtigungs-Logik hier
+    # z. B. Teams-Webhook, Telegram, etc.
+
+    return 0
+
+
+notification_plugin_registry.register(
+    NotificationPlugin(
+        name=”my_notifier”,
+        notify_function=notify,
+    )
+)
+```
+
+### 2. Altes Script-Format bleibt gültig
+
+Das klassische Script-Format (`utils.collect_context()`) funktioniert in CMK 2.5 **unverändert weiter**. Bestehende Notification-Scripts müssen nicht migriert werden.
+
+```text
+Pfad weiterhin gültig:
+~/local/share/check_mk/notifications/my_script.py
+```
+
+### 3. Edition-Umbenennung beachten
+
+| CMK 2.4 Edition | CMK 2.5 Edition |
+|---|---|
+| CEE (Commercial Edition) | **Pro** |
+| CCE (Cloud Edition) | **Ultimate** |
+| CME (Managed Services Edition) | **Ultimate MT** |
+| CRE (Raw Edition) | CRE (unverändert) |
+
+Notification-Plugins mit UI-Parametern (`IndividualOrStoredPassword`, `Valuespec`) benötigen weiterhin mindestens die **Pro**-Edition (früher CEE).
+
+### 4. `IndividualOrStoredPassword` → `cmk.rulesets.v1` in 2.5
+
+Wenn ein Notification-Plugin UI-Parameter mit Passwort-Feldern definiert, empfiehlt sich in 2.5 die neue Rulesets-API:
+
+```python
+# CMK 2.4 (Valuespec – weiterhin funktionsfähig):
+from cmk.gui.valuespec import Dictionary, HTTPUrl, IndividualOrStoredPassword
+
+# CMK 2.5 (neue Rulesets-API – empfohlen):
+from cmk.rulesets.v1.form_specs import Dictionary, DictElement, String, Password
+from cmk.rulesets.v1 import Title
+```
+
+### 5. MKP-Pfad für neue 2.5-Notification-Plugins
+
+```text
+CMK 2.5 MKP-Struktur:
+cmk_addons/plugins/<pluginname>/
+└── notification_scripts/
+    └── my_notifier.py
+```
+
+### Schnell-Checkliste Migration 2.4 → 2.5
+
+- [ ] Bestehende Scripts unter `notifications/`: keine Änderung nötig
+- [ ] Neue Plugins: `NotificationPlugin`-API aus `cmk.notification_plugins.v1` verwenden
+- [ ] UI-Parameter: Valuespec bleibt gültig; für neue Plugins `cmk.rulesets.v1` bevorzugen
+- [ ] Editionsbezeichnungen in Dokumentation: CEE → Pro, CCE → Ultimate
+- [ ] MKP: `version.min_required` auf `”2.5.0p1”` setzen

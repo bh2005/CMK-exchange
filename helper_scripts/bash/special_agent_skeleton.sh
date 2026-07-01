@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Create Checkmk 2.4 Special Agent Skeleton (with Authentication Template)
+# Create Checkmk 2.5 Special Agent Skeleton (with Authentication Template)
 # =============================================================================
 # Usage:
 #   ./mk_special_agent_skeleton.sh <plugin_family> [<site_user>] [--with-checks]
@@ -354,34 +354,47 @@ if [[ ! -e "${CALL_PATH}" ]]; then
   cat > "${CALL_PATH}" <<'EOF'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Server-side call registration for PLUGIN_FAMILY"""
+"""Server-side call registration for PLUGIN_FAMILY (CMK 2.5)"""
+
+from typing import Iterator
+
+from pydantic import BaseModel
 
 from cmk.server_side_calls.v1 import (
+    HostConfig,
+    Secret,
     SpecialAgentCommand,
     SpecialAgentConfig,
-    noop_parser,
 )
 
 
-def _agent_arguments(params, host_config):
+class PLUGIN_FAMILYParams(BaseModel):
+    url: str
+    username: str
+    password: Secret
+    insecure: str = "verify"
+
+
+def _agent_arguments(
+    params: PLUGIN_FAMILYParams,
+    host_config: HostConfig,
+) -> Iterator[SpecialAgentCommand]:
     """Generate command line arguments for the special agent."""
-    args = []
-    
-    # Required parameters
-    args.extend(["--url", params["url"]])
-    args.extend(["--username", params["username"]])
-    args.extend(["--password", params["password"].unsafe()])
-    
-    # Optional: SSL verification
-    if params.get("insecure") == "insecure":
+    args = [
+        "--url",      params.url,
+        "--username", params.username,
+        "--password", params.password.unsafe(),
+    ]
+
+    if params.insecure == "insecure":
         args.append("--insecure")
-    
+
     yield SpecialAgentCommand(command_arguments=args)
 
 
 special_agent_PLUGIN_FAMILY = SpecialAgentConfig(
     name="PLUGIN_FAMILY",
-    parameter_parser=noop_parser,
+    parameter_parser=PLUGIN_FAMILYParams.model_validate,
     commands_function=_agent_arguments,
 )
 EOF

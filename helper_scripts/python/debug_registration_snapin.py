@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # debug_snapins.py - Detaillierter Snapin-Import-Debugger
+# CMK 2.4 + 2.5: Plugin-Pfad local/lib/python3/cmk/gui/plugins/sidebar/ unverändert
+# CMK 2.5: show()-Methode hat neuen Pflichtparameter: def show(self, config: Config) -> None:
 
 import sys
 import os
