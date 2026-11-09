@@ -96,6 +96,58 @@ metric_xiq_api_remaining = metrics.Metric(
 )
 
 # ---------------------------------------------------------------------
+# API USAGE METRICS
+# ---------------------------------------------------------------------
+metric_xiq_api_limit = metrics.Metric(
+    name="xiq_api_limit",
+    title=metrics.Title("API Requests Kontingent"),
+    unit=UNIT_COUNTER,
+    color=metrics.Color.GRAY,
+)
+
+metric_xiq_api_used = metrics.Metric(
+    name="xiq_api_used",
+    title=metrics.Title("API Requests verbraucht (Zeitfenster)"),
+    unit=UNIT_COUNTER,
+    color=metrics.Color.ORANGE,
+)
+
+metric_xiq_api_calls_run = metrics.Metric(
+    name="xiq_api_calls_run",
+    title=metrics.Title("API Calls des Agent-Laufs"),
+    unit=UNIT_COUNTER,
+    color=metrics.Color.BLUE,
+)
+
+metric_xiq_api_calls_429 = metrics.Metric(
+    name="xiq_api_calls_429",
+    title=metrics.Title("API Calls gedrosselt (429)"),
+    unit=UNIT_COUNTER,
+    color=metrics.Color.RED,
+)
+
+metric_xiq_api_calls_error = metrics.Metric(
+    name="xiq_api_calls_error",
+    title=metrics.Title("API Calls mit Fehler (HTTP >= 400)"),
+    unit=UNIT_COUNTER,
+    color=metrics.Color.PINK,
+)
+
+metric_xiq_api_quota_consumed_run = metrics.Metric(
+    name="xiq_api_quota_consumed_run",
+    title=metrics.Title("Kontingent verbraucht waehrend Lauf"),
+    unit=UNIT_COUNTER,
+    color=metrics.Color.PURPLE,
+)
+
+metric_xiq_api_run_duration = metrics.Metric(
+    name="xiq_api_run_duration",
+    title=metrics.Title("Dauer des Agent-Laufs"),
+    unit=unit.SECOND,
+    color=metrics.Color.GRAY,
+)
+
+# ---------------------------------------------------------------------
 # UPTIME METRICS
 # ---------------------------------------------------------------------
 metric_xiq_uptime_seconds = metrics.Metric(

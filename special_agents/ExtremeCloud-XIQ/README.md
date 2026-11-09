@@ -74,7 +74,8 @@ Da APs oft via Piggyback überwacht werden, "erben" sie den Status des API-Abfra
 | **XIQ Radios** | Metriken pro Band (2.4/5/6 GHz): Clients, Kanäle, TX-Power. |
 | **XIQ SSID Clients** | Anzahl der Clients pro ausgestrahlter SSID. |
 | **XIQ Neighbors** | LLDP/CDP Nachbarschaftsinformationen (Switchport-Anbindung). |
-| **XIQ Rate Limits** | Überwachung des verbleibenden API-Kontingents. |
+| **XIQ API Rate Limits** | Verbleibendes und verbrauchtes API-Kontingent (XIQ sendet `RateLimit: "tenant-hour";r=...`; Kontingent mangels Angabe mit 7500/h angenommen, anpassbar über `DEFAULT_QUOTA` in `check_rate_limits.py`). |
+| **XIQ API Usage** | API-Calls des letzten Agent-Laufs (inkl. 429 und Fehler), Top-Endpoints und Vergleich mit dem tatsächlich verbrauchten Kontingent (Hinweis auf andere Nutzer desselben Tenants). |
 | **XIQ Summary** | Globale Cloud-Statistiken (Lizenzen, Geräte-Limits). |
 
 ---

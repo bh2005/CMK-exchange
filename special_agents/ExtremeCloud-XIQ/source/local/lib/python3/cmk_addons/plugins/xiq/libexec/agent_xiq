@@ -38,8 +38,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple, Iterable
 
 import requests
@@ -163,6 +166,118 @@ def _cache_save(cf: str, token: str) -> None:
 # ---------------------------------------------------------------------
 # HTTP JSON – with retries, backoff, and 401/429 handling
 # ---------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# API usage statistics – count every HTTP request of this run
+# (retries and 429 included, each one consumes quota) and remember the
+# "RateLimit: "<policy>";r=<remaining>" header XIQ sends on responses.
+# ---------------------------------------------------------------------
+_START_TS = time.time()
+_STATS_LOCK = threading.Lock()
+_API_STATS: Dict[str, Any] = {
+    "calls": 0,
+    "calls_429": 0,
+    "calls_error": 0,       # HTTP >= 400 except 429
+    "by_endpoint": {},      # path (without query) -> count
+    "rl_first": None,       # first "remaining" seen in this run
+    "rl_last": None,        # most recent "remaining" seen
+    "rl_min": None,         # lowest "remaining" seen
+    "rl_reset": None,       # seconds until window reset (t=), if sent
+    "rl_policy": None,      # e.g. "tenant-hour"
+    "rl_limit": None,       # quota (q=) from RateLimit-Policy, if sent
+    "rl_window": None,      # window seconds (w=) from RateLimit-Policy, if sent
+}
+
+
+def _parse_structured_ratelimit(hdr: Dict[str, str]) -> Dict[str, Any]:
+    """
+    Parse the IETF structured RateLimit headers XIQ uses, e.g.
+      RateLimit: "tenant-hour";r=6529;t=1234
+      RateLimit-Policy: "tenant-hour";q=7500;w=3600
+    Keys of `hdr` must be lower-case. Missing parts stay None.
+    """
+    out: Dict[str, Any] = {"policy": None, "remaining": None, "reset": None,
+                           "limit": None, "window": None}
+    rl = hdr.get("ratelimit") or ""
+    m = re.match(r'\s*"?([^";]+)"?', rl)
+    if m and ("r=" in rl or "t=" in rl):
+        out["policy"] = m.group(1).strip()
+    m = re.search(r"(?:^|;)\s*r=(\d+)", rl)
+    if m:
+        out["remaining"] = int(m.group(1))
+    m = re.search(r"(?:^|;)\s*t=(\d+)", rl)
+    if m:
+        out["reset"] = int(m.group(1))
+    pol = hdr.get("ratelimit-policy") or ""
+    m = re.search(r"(?:^|;)\s*q=(\d+)", pol)
+    if m:
+        out["limit"] = int(m.group(1))
+    m = re.search(r"(?:^|;)\s*w=(\d+)", pol)
+    if m:
+        out["window"] = int(m.group(1))
+    return out
+
+
+def _stats_record(path: str, resp: Any) -> None:
+    """Count one HTTP request (resp may be None if it never got a response)."""
+    endpoint = (path or "").split("?", 1)[0] or "/"
+    with _STATS_LOCK:
+        _API_STATS["calls"] += 1
+        eps = _API_STATS["by_endpoint"]
+        eps[endpoint] = eps.get(endpoint, 0) + 1
+        if resp is None:
+            return
+        code = getattr(resp, "status_code", 0) or 0
+        if code == 429:
+            _API_STATS["calls_429"] += 1
+        elif code >= 400:
+            _API_STATS["calls_error"] += 1
+        try:
+            hdr = {k.lower(): v for k, v in dict(resp.headers).items()}
+        except Exception:
+            return
+        info = _parse_structured_ratelimit(hdr)
+        if info["policy"]:
+            _API_STATS["rl_policy"] = info["policy"]
+        if info["limit"] is not None:
+            _API_STATS["rl_limit"] = info["limit"]
+        if info["window"] is not None:
+            _API_STATS["rl_window"] = info["window"]
+        if info["reset"] is not None:
+            _API_STATS["rl_reset"] = info["reset"]
+        rem = info["remaining"]
+        if rem is not None:
+            if _API_STATS["rl_first"] is None:
+                _API_STATS["rl_first"] = rem
+            _API_STATS["rl_last"] = rem
+            if _API_STATS["rl_min"] is None or rem < _API_STATS["rl_min"]:
+                _API_STATS["rl_min"] = rem
+
+
+def print_api_usage_section() -> None:
+    """Emit <<<extreme_cloud_iq_api_usage:sep(124)>>> (main host section)."""
+    with _STATS_LOCK:
+        st = dict(_API_STATS)
+        eps = dict(st["by_endpoint"])
+    print("<<<extreme_cloud_iq_api_usage:sep(124)>>>")
+    print(f"calls_total|{st['calls']}")
+    print(f"calls_429|{st['calls_429']}")
+    print(f"calls_error|{st['calls_error']}")
+    print(f"duration_s|{int(time.time() - _START_TS)}")
+    for key, name in (
+        ("rl_policy", "policy"),
+        ("rl_first", "remaining_first"),
+        ("rl_last", "remaining_last"),
+        ("rl_min", "remaining_min"),
+        ("rl_reset", "reset_in_seconds"),
+        ("rl_limit", "limit"),
+        ("rl_window", "window_s"),
+    ):
+        if st[key] is not None:
+            print(f"{name}|{st[key]}")
+    for ep, cnt in sorted(eps.items(), key=lambda kv: (-kv[1], kv[0])):
+        print(f"endpoint|{ep}|{cnt}")
+
+
 def api_login(
     base_url: str,
     username: str,
@@ -178,6 +293,7 @@ def api_login(
         json={"username": username, "password": password},
         timeout=timeout,
     )
+    _stats_record("/login", r)
     r.raise_for_status()
     token = r.json().get("access_token")
     if not token:
@@ -215,12 +331,16 @@ def api_request_json(
             s = _mk_session(verify, proxy)
             headers = {"Authorization": f"Bearer {token}"}
             r = s.request(method, url, headers=headers, params=params, timeout=timeout)
+            _stats_record(path, r)
 
             if r.status_code == 401:
                 return "RELOGIN", None, r
             if r.status_code == 429:
                 # back off and retry
                 continue
+            if r.status_code >= 400:
+                # Permanent client/server error — retrying won't help
+                return "ERROR", None, r
 
             r.raise_for_status()
 
@@ -291,6 +411,19 @@ def _rate_limit_from_resp(resp) -> Dict[str, Any]:
     remaining_val = _to_int_safe_str(raw_remaining)
     reset_val = _to_int_safe_str(raw_reset)
 
+    # XIQ sends the structured form  RateLimit: "tenant-hour";r=<remaining>
+    # (+ optionally RateLimit-Policy: ...;q=<limit>;w=<window>) instead of
+    # the classic RateLimit-Limit/-Remaining/-Reset headers.
+    structured = _parse_structured_ratelimit(hdr)
+    if remaining_val is None:
+        remaining_val = structured["remaining"]
+    if reset_val is None:
+        reset_val = structured["reset"]
+    if limit_val is None:
+        limit_val = structured["limit"]
+    if window_s is None:
+        window_s = structured["window"]
+
     info = {
         "state": "OK",
         "limit": limit_val,
@@ -325,6 +458,7 @@ def _rate_limit_try_paths_raw(
         url = f"{base_url.rstrip('/')}{path}"
         try:
             r = s.get(url, headers=headers, timeout=timeout, allow_redirects=False)
+            _stats_record(path, r)
             if r.status_code == 401:
                 return False, {"state": "RELOGIN", "status_code": r.status_code}
             info = _rate_limit_from_resp(r)
@@ -333,8 +467,8 @@ def _rate_limit_try_paths_raw(
         except Exception as e:
             return False, {"state": "NO_RESPONSE", "error": str(e)}
 
-    # 1) /devices?page=1&limit=1&views=ID&async=false
-    ok1, info1 = _probe("/devices?page=1&limit=1&views=ID&async=false")
+    # 1) /devices?page=1&limit=1&async=false  ('views=ID' is invalid -> HTTP 400)
+    ok1, info1 = _probe("/devices?page=1&limit=1&async=false")
     if ok1:
         return True, info1
     if info1.get("state") == "RELOGIN":
@@ -378,7 +512,7 @@ def fetch_rate_limits(
             timeout,
             verify,
             proxy,
-            params={"page": 1, "limit": 1, "views": "ID", "async": "false"},
+            params={"page": 1, "limit": 1, "async": "false"},
         )
         if resp is not None:
             return True, _rate_limit_from_resp(resp)
@@ -562,6 +696,77 @@ def get_radio_information_for_device(
     return []
 
 
+# XIQ: GET /devices/radio-information rejects limit > 50 with HTTP 400
+RADIO_PAGE_LIMIT = 50
+
+
+def get_radio_information_all_batched(
+    base_url: str,
+    token: str,
+    timeout: int,
+    verify: bool,
+    proxy: Optional[str],
+    device_ids: List[int],
+    batch_size: int = RADIO_PAGE_LIMIT,
+) -> Dict[int, List[Dict[str, Any]]]:
+    """
+    Fetch radio info for all APs in batches of batch_size.
+    The XIQ API allows at most 50 items per page for this endpoint
+    (limit > 50 -> HTTP 400), so batch_size is capped at 50 and further
+    pages are requested if a batch returns a full page.
+    Returns {device_id: [radios]}.
+    On RELOGIN returns {"_relogin": True}.
+    """
+    result: Dict[int, List[Dict[str, Any]]] = {did: [] for did in device_ids}
+    if not device_ids:
+        return result
+
+    batch_size = max(1, min(batch_size, RADIO_PAGE_LIMIT))
+
+    for i in range(0, len(device_ids), batch_size):
+        batch = device_ids[i : i + batch_size]
+
+        for page in range(1, 6):  # safety cap: 5 pages per batch
+            params: List[Tuple[str, Any]] = [
+                ("page", page), ("limit", RADIO_PAGE_LIMIT), ("async", "false")
+            ]
+            for did in batch:
+                params.append(("deviceIds", str(did)))
+
+            status, payload, _ = api_request_json(
+                base_url, "/devices/radio-information", token, timeout, verify, proxy, params=params
+            )
+            if status == "RELOGIN":
+                return {"_relogin": True}  # type: ignore[return-value]
+            if status != "OK" or not payload:
+                break
+
+            data = payload.get("data", []) if isinstance(payload, dict) else payload
+            if not isinstance(data, list):
+                break
+
+            for entry in data:
+                try:
+                    did = int(entry.get("device_id"))
+                    if did in result:
+                        result[did].extend(entry.get("radios") or [])
+                except Exception:
+                    continue
+
+            # Next page only if the API says there is one. (Do not rely on
+            # len(data) == limit: the API returns page 1 again for page > total_pages.)
+            total_pages = payload.get("total_pages") if isinstance(payload, dict) else None
+            if total_pages is None:
+                total_pages = 1
+            try:
+                if page >= int(total_pages):
+                    break
+            except (TypeError, ValueError):
+                break
+
+    return result
+
+
 def _band_failsafe_from_client(c: dict) -> str:
     """Return one of: '2.4GHz', '5GHz', '6GHz'."""
     try:
@@ -600,15 +805,18 @@ def get_active_clients_for_devices_batched(
     page_limit: int = 100,
     views: str = "FULL",
     sort_order: str = "ASC",
-) -> Tuple[str, Dict[int, Dict[str, Dict[str, int]]]]:
+) -> Tuple[str, Dict[int, Dict[str, Dict[str, int]]], Dict[int, List[Dict[str, Any]]]]:
     """
     Fetch active clients via GET /clients/active with repeated deviceIds parameters.
 
     Returns:
-      ("OK", { device_id: { ssid: { "2.4GHz": n, "5GHz": n, "6GHz": n } } })
-      or ("RELOGIN", {}) on 401.
+      ("OK", ssid_freq, full_clients)
+        ssid_freq:    { device_id: { ssid: { "2.4GHz": n, "5GHz": n, "6GHz": n } } }
+        full_clients: { device_id: [raw_client_objects] }
+      or ("RELOGIN", {}, {}) on 401.
     """
     result: Dict[int, Dict[str, Dict[str, int]]] = {int(d): {} for d in device_ids}
+    full_clients: Dict[int, List[Dict[str, Any]]] = {int(d): [] for d in device_ids}
 
     def batches(lst: List[int], n: int) -> Iterable[List[int]]:
         for i in range(0, len(lst), max(1, n)):
@@ -639,7 +847,7 @@ def get_active_clients_for_devices_batched(
                 params=params_list,
             )
             if status == "RELOGIN":
-                return "RELOGIN", {}
+                return "RELOGIN", {}, {}
             if status != "OK" or not data:
                 break
 
@@ -655,6 +863,9 @@ def get_active_clients_for_devices_batched(
                     did = int(did_raw)
                     if did not in result:
                         continue
+
+                    full_clients[did].append(c)
+
                     ssid = (c.get("ssid") or "").strip()
                     if not ssid:
                         continue
@@ -676,7 +887,7 @@ def get_active_clients_for_devices_batched(
                     break
             page += 1
 
-    return "OK", result
+    return "OK", result, full_clients
 
 
 # ---------------------------------------------------------------------
@@ -687,6 +898,7 @@ def _print_piggy_ap(
     dev_id: int,
     ssid_freq: Dict[str, Dict[str, int]],
     radio_list: List[Dict[str, Any]],
+    raw_clients: List[Dict[str, Any]],
 ) -> Tuple[int, int, int, int]:
     """
     Print all piggyback sections for a single AP and return (total, c24, c5, c6).
@@ -788,60 +1000,29 @@ def _print_piggy_ap(
         "_ssid_freq": ssid_freq,
     }, ensure_ascii=False))
 
-    # active clients for inventory (details + summary)
+    # active clients for inventory — pre-fetched by batched call, no extra API request
     ap_clients: List[Dict[str, Any]] = []
-    try:
-        params_list = [
-            ("page", 1),
-            ("limit", 100),
-            ("views", "FULL"),
-            ("sortOrder", "ASC"),
-            ("clientConnectionTypes", "1"),
-            ("excludeLocallyManaged", "false"),
-            ("deviceIds", str(dev_id)),
-        ]
-        status_cli_inv, data_cli_inv, _ = api_request_json(
-            args.url, "/clients/active", token, args.timeout, verify, args.proxy,
-            method="GET", params=params_list
-        )
-        if status_cli_inv == "RELOGIN":
-            # re-login on demand
-            new_token = api_login(args.url, args.username, args.password, args.timeout, verify, args.proxy, cachefile)
-            status_cli_inv, data_cli_inv, _ = api_request_json(
-                args.url, "/clients/active", new_token, args.timeout, verify, args.proxy,
-                method="GET", params=params_list
-            )
-            # Update outer token if relogin worked
-            if status_cli_inv == "OK":
-                token_holder["val"] = new_token
-
-        if status_cli_inv == "OK" and isinstance(data_cli_inv, dict):
-            for c in data_cli_inv.get("data") or []:
-                try:
-                    if int(c.get("device_id")) != dev_id:
-                        continue
-                except Exception:
-                    continue
-
-                ap_clients.append({
-                    "id": c.get("id"),
-                    "hostname": c.get("hostname") or "",
-                    "mac": format_mac(c.get("mac_address") or ""),
-                    "ip": c.get("ip_address") or "",
-                    "ssid": c.get("ssid") or "",
-                    "band": norm_band_from_active_client(c),
-                    "bssid": format_mac(c.get("bssid") or ""),
-                    "rssi": _safe_int(c.get("rssi"), 0),
-                    "snr": _safe_int(c.get("snr"), 0),
-                    "channel": _safe_int(c.get("channel"), 0),
-                    "ap_name": c.get("device_name") or hostname,
-                    "ap_id": c.get("device_id"),
-                    "os_type": c.get("os_type") or "",
-                    "user_profile": c.get("user_profile_name") or "",
-                    "connected": bool(c.get("connected", False)),
-                })
-    except Exception:
-        pass
+    for c in raw_clients:
+        try:
+            ap_clients.append({
+                "id": c.get("id"),
+                "hostname": c.get("hostname") or "",
+                "mac": format_mac(c.get("mac_address") or ""),
+                "ip": c.get("ip_address") or "",
+                "ssid": c.get("ssid") or "",
+                "band": norm_band_from_active_client(c),
+                "bssid": format_mac(c.get("bssid") or ""),
+                "rssi": _safe_int(c.get("rssi"), 0),
+                "snr": _safe_int(c.get("snr"), 0),
+                "channel": _safe_int(c.get("channel"), 0),
+                "ap_name": c.get("device_name") or hostname,
+                "ap_id": c.get("device_id"),
+                "os_type": c.get("os_type") or "",
+                "user_profile": c.get("user_profile_name") or "",
+                "connected": bool(c.get("connected", False)),
+            })
+        except Exception:
+            continue
 
     print("<<<xiq_active_clients:json>>>")
     print(json.dumps({
@@ -863,7 +1044,7 @@ def _print_piggy_ap(
 # MAIN – glue all pieces together
 # ---------------------------------------------------------------------
 def main():
-    global args, token, verify, cachefile, token_holder  # for nested relogin use
+    global args, token, verify, cachefile
     args = parse_args()
     verify = not args.no_cert_check
     cachefile = _cache_path(args.host)
@@ -932,37 +1113,54 @@ def main():
             except Exception:
                 pass
 
-    # Multi-device active clients (per-AP SSID-band counters)
-    status_cli, all_ssid_freq = get_active_clients_for_devices_batched(
-        args.url,
-        token,
-        args.timeout,
-        verify,
-        args.proxy,
-        ap_ids,
-        batch_size=args.clients_batch_size,
-        max_pages=args.clients_max_pages,
-        page_limit=args.clients_page_limit,
-        views=args.clients_views,
-        sort_order=args.clients_sort_order,
-    )
-    if status_cli == "RELOGIN":
-        token = api_login(
-            args.url, args.username, args.password, args.timeout, verify, args.proxy, cachefile
+    # Radio-info (batch) + active clients run in parallel
+    def _fetch_radios():
+        return get_radio_information_all_batched(
+            args.url, token, args.timeout, verify, args.proxy, ap_ids
         )
-        status_cli, all_ssid_freq = get_active_clients_for_devices_batched(
-            args.url,
-            token,
-            args.timeout,
-            verify,
-            args.proxy,
-            ap_ids,
+
+    def _fetch_clients():
+        return get_active_clients_for_devices_batched(
+            args.url, token, args.timeout, verify, args.proxy, ap_ids,
             batch_size=args.clients_batch_size,
             max_pages=args.clients_max_pages,
             page_limit=args.clients_page_limit,
             views=args.clients_views,
             sort_order=args.clients_sort_order,
         )
+
+    with ThreadPoolExecutor(max_workers=2) as _exe:
+        _f_radio = _exe.submit(_fetch_radios)
+        _f_clients = _exe.submit(_fetch_clients)
+        all_radio_info = _f_radio.result()
+        cli_result = _f_clients.result()
+
+    # Handle RELOGIN for radio batch
+    if all_radio_info.get("_relogin"):
+        token = api_login(
+            args.url, args.username, args.password, args.timeout, verify, args.proxy, cachefile
+        )
+        all_radio_info = get_radio_information_all_batched(
+            args.url, token, args.timeout, verify, args.proxy, ap_ids
+        )
+
+    # Handle RELOGIN for clients batch
+    status_cli = cli_result[0]
+    if status_cli == "RELOGIN":
+        token = api_login(
+            args.url, args.username, args.password, args.timeout, verify, args.proxy, cachefile
+        )
+        cli_result = get_active_clients_for_devices_batched(
+            args.url, token, args.timeout, verify, args.proxy, ap_ids,
+            batch_size=args.clients_batch_size,
+            max_pages=args.clients_max_pages,
+            page_limit=args.clients_page_limit,
+            views=args.clients_views,
+            sort_order=args.clients_sort_order,
+        )
+        status_cli = cli_result[0]
+
+    _, all_ssid_freq, all_full_clients = cli_result
 
     # Print piggyback per AP
     ap_count = 0
@@ -971,28 +1169,15 @@ def main():
     sum_clients_6 = 0
     sum_clients_total = 0
 
-    # Token holder for nested relogin inside piggyback section fetches
-    token_holder = {"val": token}
-
     for dev in ap_candidates:
         ap_count += 1
         dev_id = int(dev.get("id"))
 
-        # Radio info with relogin fallback
-        radio_list = get_radio_information_for_device(
-            args.url, token_holder["val"], args.timeout, verify, args.proxy, dev_id
-        )
-        if isinstance(radio_list, list) and radio_list and \
-           isinstance(radio_list[0], dict) and radio_list[0].get("_error") == "RELOGIN":
-            new_token = api_login(args.url, args.username, args.password, args.timeout, verify, args.proxy, cachefile)
-            token_holder["val"] = new_token
-            radio_list = get_radio_information_for_device(
-                args.url, new_token, args.timeout, verify, args.proxy, dev_id
-            )
-
+        radio_list = all_radio_info.get(dev_id, [])
         ssid_freq = all_ssid_freq.get(dev_id, {})
+        raw_clients = all_full_clients.get(dev_id, [])
 
-        ap_total, ap_24, ap_5, ap_6 = _print_piggy_ap(dev, dev_id, ssid_freq, radio_list)
+        ap_total, ap_24, ap_5, ap_6 = _print_piggy_ap(dev, dev_id, ssid_freq, radio_list, raw_clients)
 
         sum_clients_24 += ap_24
         sum_clients_5 += ap_5
@@ -1060,6 +1245,9 @@ def main():
                 f"{dev_id}|{hostname}|{host_ip}|{local_port}|{management_ip}|"
                 f"{remote_port}|{port_desc}|{mac_address}|{remote_device}"
             )
+
+    # API USAGE of this run (H1) – must be last so all calls are counted
+    print_api_usage_section()
 
     sys.exit(0)
 
